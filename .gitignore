@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+
+# Android/Gradle build output and machine-local SDK configuration
+apps/android/.gradle/
+apps/android/build/
+apps/android/app/build/
+apps/android/local.properties
+*.apk
+*.aab
+
+# IDE and editor state
+.idea/
+.vscode/
+*.iml
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.p12
+*.jks
+*.keystore
+*.pem
+*.key
+
+# OS metadata
+.DS_Store
+Thumbs.db
