@@ -66,10 +66,11 @@ Not captured:
 - Per-client packet loss as a percentage over the full session; only the client
   `Sequences lost` counter above is recorded, which is 0 over 6853 packets.
 
-Open gap found during the run:
+Gap found during the run, now closed:
 
-- The client shows no positive confirmation that the control channel is connected. The
-  `Control:` line only renders after `showControlError`, so a healthy session shows only the
-  initial `Errors: none` and looks identical to a session whose control channel never
-  connected. Server-side evidence was needed to confirm the WebSocket. This should be
-  addressed before the control channel is depended on in the field.
+- The client originally gave no positive confirmation that the control channel was connected.
+  The `Control:` line only rendered after `showControlError`, so a healthy session looked
+  identical to one whose WebSocket never connected, and server-side evidence was needed to
+  confirm the connection. The client now reports the control channel state directly:
+  `Control: connected - mix applied on the server` while the channel is up, and
+  `Control: unavailable - mixing on this device` when it is not.

@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var statusText: TextView
+    private lateinit var controlStatusText: TextView
     private lateinit var statsText: TextView
     private lateinit var errorText: TextView
     private lateinit var volumeSeekBar: SeekBar
@@ -44,6 +45,7 @@ class MainActivity : Activity() {
     @Volatile private var controlWebSocket: WebSocket? = null
     @Volatile private var lastError = "none"
     @Volatile private var controlError = "none"
+    @Volatile private var controlState = ControlState.IDLE
     @Volatile private var volumePercent = 100
     @Volatile private var maxLevelPercent = 100
     @Volatile private var muted = false
@@ -52,6 +54,8 @@ class MainActivity : Activity() {
     private val controlListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             controlWebSocket = webSocket
+            controlState = ControlState.CONNECTED
+            renderControlStatus()
             sendCurrentMix()
         }
 
@@ -68,11 +72,15 @@ class MainActivity : Activity() {
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             controlWebSocket = null
+            controlState = if (running.get()) ControlState.UNAVAILABLE else ControlState.IDLE
+            renderControlStatus()
             if (running.get()) showControlError("WebSocket error: ${t.message ?: "connection failed"}")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             controlWebSocket = null
+            controlState = if (running.get()) ControlState.CLOSED else ControlState.IDLE
+            renderControlStatus()
         }
     }
 
@@ -86,6 +94,7 @@ class MainActivity : Activity() {
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
         statusText = findViewById(R.id.statusText)
+        controlStatusText = findViewById(R.id.controlStatusText)
         statsText = findViewById(R.id.statsText)
         errorText = findViewById(R.id.errorText)
         volumeSeekBar = findViewById(R.id.volumeSeekBar)
@@ -157,6 +166,8 @@ class MainActivity : Activity() {
         controlPortInput.isEnabled = false
         statusText.text = "Status: Starting on UDP port $port; control port $controlPort"
         updateStats(0, 0, null)
+        controlState = ControlState.CONNECTING
+        renderControlStatus()
         connectControl(host, controlPort)
 
         val thread = Thread({ receiveLoop(host, port) }, "pmon-udp-receiver")
@@ -176,6 +187,8 @@ class MainActivity : Activity() {
         controlPortInput.isEnabled = true
         controlWebSocket?.close(1000, "stopped")
         controlWebSocket = null
+        controlState = ControlState.IDLE
+        renderControlStatus()
     }
 
     private fun receiveLoop(host: String, port: Int) {
@@ -389,6 +402,17 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun renderControlStatus() {
+        val label = when (controlState) {
+            ControlState.IDLE -> "not connected"
+            ControlState.CONNECTING -> "connecting..."
+            ControlState.CONNECTED -> "connected - mix applied on the server"
+            ControlState.UNAVAILABLE -> "unavailable - mixing on this device"
+            ControlState.CLOSED -> "closed - mixing on this device"
+        }
+        runOnUiThread { controlStatusText.text = "Control: $label" }
+    }
+
     private fun connectControl(host: String, port: Int) {
         controlExecutor.execute {
             try {
@@ -430,3 +454,5 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 }
+
+private enum class ControlState { IDLE, CONNECTING, CONNECTED, UNAVAILABLE, CLOSED }

@@ -106,9 +106,10 @@ applies no local processing. The sliders are remote controls: their values trave
 WebSocket and are applied per client IP on the server. A slider at `50%` should now sound like
 roughly half level (about `-6 dB`), not a quarter.
 
-Confirm on each device that the control channel is up: the `Control:` line shows no error. If it
-shows a WebSocket error, that device fell back to local processing and the level comparison in
-Step 5 is not valid for absolute gain.
+Confirm on each device that the control channel is up: the `Control:` line must read
+`connected - mix applied on the server`. If it reads `unavailable - mixing on this device`,
+that device fell back to local processing and the level comparison in Step 5 is not valid for
+absolute gain.
 
 ## Step 5 - Prove independence
 
@@ -226,7 +227,11 @@ Accepted gaps:
   screenshot. Its control channel is evidenced by the server connection log.
 - Server aggregate counters at shutdown were not captured. The server was stopped without a
   clean Ctrl+C, so no summary was printed.
-- The client provides no positive control-channel indicator; server-side evidence was needed
-  to confirm the WebSocket. See `m1-independent-mixes.md`, "Verification Status".
+
+Closed after the run:
+
+- The client had no positive control-channel indicator, so server-side evidence was required
+  to confirm the WebSocket. The client now reports the control channel state directly; see
+  "Step 4".
 
 Detailed evidence is recorded in `odd/tasks/m1-independent-mixes.md`.
