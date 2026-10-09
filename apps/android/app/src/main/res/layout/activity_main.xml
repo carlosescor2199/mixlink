@@ -135,6 +135,61 @@
             android:text="100%" />
 
         <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Mix banks" />
+
+        <EditText
+            android:id="@+id/bankNameInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Bank name"
+            android:inputType="text"
+            android:singleLine="true" />
+
+        <Button
+            android:id="@+id/saveBankButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Save current mix" />
+
+        <TextView
+            android:id="@+id/bankStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No saved banks" />
+
+        <LinearLayout
+            android:id="@+id/bankContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Musician channel" />
+
+        <Spinner
+            android:id="@+id/musicianChannelSpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <CheckBox
+            android:id="@+id/moreOfMeCheckBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="More of me" />
+
+        <TextView
+            android:id="@+id/moreOfMeStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="More of me is off" />
+
+        <TextView
             android:id="@+id/statsText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

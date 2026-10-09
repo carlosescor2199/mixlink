@@ -5,11 +5,15 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Bundle
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.TextView
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -41,6 +45,14 @@ class MainActivity : Activity() {
     private lateinit var muteCheckBox: CheckBox
     private lateinit var volumeValueText: TextView
     private lateinit var maxLevelValueText: TextView
+    private lateinit var bankNameInput: EditText
+    private lateinit var saveBankButton: Button
+    private lateinit var bankStatusText: TextView
+    private lateinit var bankContainer: LinearLayout
+    private lateinit var musicianChannelSpinner: Spinner
+    private lateinit var moreOfMeCheckBox: CheckBox
+    private lateinit var moreOfMeStatusText: TextView
+    private lateinit var bankStore: MixBankStore
 
     private val running = AtomicBoolean(false)
     @Volatile private var socket: DatagramSocket? = null
@@ -58,6 +70,10 @@ class MainActivity : Activity() {
     @Volatile private var volumePercent = 100
     @Volatile private var maxLevelPercent = 100
     @Volatile private var muted = false
+    @Volatile private var moreOfMeEnabled = false
+    @Volatile private var musicianChannel: Int? = null
+    private var updatingMusicianSpinner = false
+    private var updatingMoreOfMe = false
     private val controlExecutor = Executors.newSingleThreadExecutor()
     private val httpClient = OkHttpClient()
     private val controlListener = object : WebSocketListener() {
@@ -122,6 +138,26 @@ class MainActivity : Activity() {
         muteCheckBox = findViewById(R.id.muteCheckBox)
         volumeValueText = findViewById(R.id.volumeValueText)
         maxLevelValueText = findViewById(R.id.maxLevelValueText)
+        bankNameInput = findViewById(R.id.bankNameInput)
+        saveBankButton = findViewById(R.id.saveBankButton)
+        bankStatusText = findViewById(R.id.bankStatusText)
+        bankContainer = findViewById(R.id.bankContainer)
+        musicianChannelSpinner = findViewById(R.id.musicianChannelSpinner)
+        moreOfMeCheckBox = findViewById(R.id.moreOfMeCheckBox)
+        moreOfMeStatusText = findViewById(R.id.moreOfMeStatusText)
+
+        bankStore = MixBankStore(this)
+        musicianChannel = bankStore.musicianChannel()
+        saveBankButton.setOnClickListener { saveCurrentBank() }
+        moreOfMeCheckBox.setOnCheckedChangeListener { _, checked -> onMoreOfMeToggled(checked) }
+        musicianChannelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                onMusicianChannelSelected(position)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+        rebuildBankList()
 
         volumeSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -449,40 +485,53 @@ class MainActivity : Activity() {
     private fun sendMixControl() {
         controlExecutor.execute {
             val webSocket = controlWebSocket ?: return@execute
-            val gains = channelGains
-            val pans = channelPans
-            val mutes = channelMutes
-            val solos = channelSolos
-            val channels = JSONArray()
-            for (index in gains.indices) {
-                channels.put(gains[index])
-            }
-            val panLevels = JSONArray()
-            for (index in pans.indices) {
-                panLevels.put(pans[index])
-            }
-            val muteFlags = JSONArray()
-            for (index in mutes.indices) {
-                muteFlags.put(mutes[index])
-            }
-            val soloFlags = JSONArray()
-            for (index in solos.indices) {
-                soloFlags.put(solos[index])
-            }
-            val message = JSONObject()
-                .put("type", "mix")
-                .put("volume_percent", volumePercent)
-                .put("max_level_percent", maxLevelPercent)
-                .put("muted", muted)
-                .put("channels", channels)
-                .put("pans", panLevels)
-                .put("mutes", muteFlags)
-                .put("solos", soloFlags)
-                .toString()
-            if (!webSocket.send(message) && running.get()) {
+            val stored = currentSnapshot()
+            // `More of me` is derived here, at send time, and never written back. The stored values
+            // stay exactly as the musician left them, so turning the control off re-sends them.
+            val outgoing = if (moreOfMeEnabled) stored.moreOfMe(musicianChannel) ?: stored else stored
+            if (!webSocket.send(buildMixMessage(outgoing)) && running.get()) {
                 showControlError("WebSocket rejected mix update")
             }
         }
+    }
+
+    private fun currentSnapshot(): MixSnapshot = MixSnapshot(
+        channelGains = channelGains,
+        channelPans = channelPans,
+        channelMutes = channelMutes,
+        channelSolos = channelSolos,
+        volumePercent = volumePercent,
+        maxLevelPercent = maxLevelPercent,
+        muted = muted,
+    )
+
+    private fun buildMixMessage(snapshot: MixSnapshot): String {
+        val channels = JSONArray()
+        for (gain in snapshot.channelGains) {
+            channels.put(gain)
+        }
+        val panLevels = JSONArray()
+        for (pan in snapshot.channelPans) {
+            panLevels.put(pan)
+        }
+        val muteFlags = JSONArray()
+        for (mute in snapshot.channelMutes) {
+            muteFlags.put(mute)
+        }
+        val soloFlags = JSONArray()
+        for (solo in snapshot.channelSolos) {
+            soloFlags.put(solo)
+        }
+        return JSONObject()
+            .put("type", "mix")
+            .put("volume_percent", snapshot.volumePercent)
+            .put("max_level_percent", snapshot.maxLevelPercent)
+            .put("muted", snapshot.muted)
+            .put("channels", channels)
+            .put("pans", panLevels)
+            .put("mutes", muteFlags)
+            .put("solos", soloFlags)
+            .toString()
     }
 
     private fun syncChannelControls(channels: Int) {
@@ -492,16 +541,20 @@ class MainActivity : Activity() {
         channelPans = IntArray(channels) { index -> defaultPan(index) }
         channelMutes = BooleanArray(channels)
         channelSolos = BooleanArray(channels)
-        runOnUiThread { rebuildChannelControls(channels) }
+        runOnUiThread {
+            rebuildChannelControls(channels)
+            renderMusicianChannel()
+        }
     }
 
     private fun rebuildChannelControls(channels: Int) {
         channelContainer.removeAllViews()
         for (index in 0 until channels) {
-            val gainLabel = TextView(this).apply { text = channelLabel(index, 100) }
+            val initialGain = channelGains.getOrElse(index) { 100 }
+            val gainLabel = TextView(this).apply { text = channelLabel(index, initialGain) }
             val gainSeekBar = SeekBar(this).apply {
                 max = 100
-                progress = 100
+                progress = initialGain
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
                         gainLabel.text = channelLabel(index, progress)
@@ -569,6 +622,134 @@ class MainActivity : Activity() {
     }
 
     private fun defaultPan(index: Int): Int = if (index % 2 == 0) 0 else 100
+
+    private fun saveCurrentBank() {
+        val name = bankNameInput.text.toString().trim()
+        if (name.isEmpty()) {
+            bankStatusText.text = "Enter a bank name before saving"
+            return
+        }
+        bankStore.saveBank(name, currentSnapshot())
+        bankNameInput.setText("")
+        bankStatusText.text = "Saved \"$name\""
+        rebuildBankList()
+    }
+
+    private fun rebuildBankList() {
+        bankContainer.removeAllViews()
+        val banks = bankStore.loadBanks()
+        if (banks.isEmpty()) {
+            bankStatusText.text = "No saved banks"
+            return
+        }
+        for (bank in banks) {
+            val nameView = TextView(this).apply {
+                text = bank.name
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val recallButton = Button(this).apply {
+                text = "Recall"
+                setOnClickListener { recallBank(bank.name) }
+            }
+            val deleteButton = Button(this).apply {
+                text = "Delete"
+                setOnClickListener {
+                    bankStore.deleteBank(bank.name)
+                    bankStatusText.text = "Deleted \"${bank.name}\""
+                    rebuildBankList()
+                }
+            }
+            bankContainer.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(nameView)
+                addView(recallButton)
+                addView(deleteButton)
+            })
+        }
+    }
+
+    private fun recallBank(name: String) {
+        val bank = bankStore.loadBanks().firstOrNull { it.name == name }
+        if (bank == null) {
+            bankStatusText.text = "Bank \"$name\" is no longer stored"
+            rebuildBankList()
+            return
+        }
+        applySnapshot(bank.snapshot)
+        bankStatusText.text = "Recalled \"$name\""
+    }
+
+    /**
+     * Applies a recalled bank to the live controls and sends the resulting mix through the existing
+     * `mix` path, exactly as if the musician had moved every control by hand.
+     */
+    private fun applySnapshot(snapshot: MixSnapshot) {
+        channelGains = snapshot.channelGains.copyOf()
+        channelPans = snapshot.channelPans.copyOf()
+        channelMutes = snapshot.channelMutes.copyOf()
+        channelSolos = snapshot.channelSolos.copyOf()
+        volumePercent = snapshot.volumePercent
+        maxLevelPercent = snapshot.maxLevelPercent
+        muted = snapshot.muted
+        runOnUiThread {
+            volumeSeekBar.progress = volumePercent
+            volumeValueText.text = "$volumePercent%"
+            maxLevelSeekBar.progress = maxLevelPercent
+            maxLevelValueText.text = "$maxLevelPercent%"
+            muteCheckBox.isChecked = muted
+            rebuildChannelControls(channelGains.size)
+            sendMixControl()
+        }
+    }
+
+    private fun onMoreOfMeToggled(checked: Boolean) {
+        if (updatingMoreOfMe) return
+        if (checked && musicianChannel == null) {
+            updatingMoreOfMe = true
+            moreOfMeCheckBox.isChecked = false
+            updatingMoreOfMe = false
+            moreOfMeStatusText.text = "More of me needs your channel: pick one above first"
+            return
+        }
+        moreOfMeEnabled = checked
+        moreOfMeStatusText.text = if (checked) "More of me is on" else "More of me is off"
+        sendMixControl()
+    }
+
+    private fun onMusicianChannelSelected(position: Int) {
+        if (updatingMusicianSpinner) return
+        val selected = if (position <= 0) null else position - 1
+        musicianChannel = selected
+        bankStore.setMusicianChannel(selected)
+        when {
+            selected == null && moreOfMeEnabled -> {
+                updatingMoreOfMe = true
+                moreOfMeCheckBox.isChecked = false
+                updatingMoreOfMe = false
+                moreOfMeEnabled = false
+                moreOfMeStatusText.text = "More of me is off: no channel selected"
+                sendMixControl()
+            }
+            moreOfMeEnabled -> sendMixControl()
+        }
+    }
+
+    private fun renderMusicianChannel() {
+        if (sourceChannels > 0 && musicianChannel != null && musicianChannel !in 0 until sourceChannels) {
+            musicianChannel = null
+            bankStore.setMusicianChannel(null)
+        }
+        val entries = ArrayList<String>(sourceChannels + 1)
+        entries.add("None")
+        for (index in 0 until sourceChannels) {
+            entries.add("Channel ${index + 1}")
+        }
+        updatingMusicianSpinner = true
+        musicianChannelSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, entries)
+            .also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        musicianChannelSpinner.setSelection((musicianChannel ?: -1) + 1)
+        updatingMusicianSpinner = false
+    }
 
     override fun onDestroy() {
         stopReceiver()
