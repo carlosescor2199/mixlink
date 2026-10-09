@@ -175,8 +175,8 @@ Two things were observed during this run and are **not resolved**:
   was disconnected first. Treat it as an open question, not a regression, until a quiet run is
   taken.
 - The captured level was low: the peak absolute sample in a sampled packet was 34 of 32767. The
-  operator may simply not have been playing at that moment, so this is a note rather than a
-  finding, but the input gain on the interface is worth a glance.
+  operator confirmed afterwards that the source had been disconnected at that moment, so this was
+  silence rather than a gain problem. Not a finding.
 
 ### Device gotcha found while running P4
 
