@@ -134,10 +134,20 @@ On-device on SM-S916B: two labelled faders rendered automatically from the annou
 count, `Status: Receiving`, `Control: connected - mix applied on the server`, 719 packets,
 0 sequences lost, 48000 Hz, no errors.
 
-Not verified: the phone's outbound JSON was not independently captured, so "a fader movement
-reaches the server" rests on the client code path plus the protocol verification above rather
-than on an observed message. No acoustic or bit-level comparison of two clients' per-channel
-output was made; the per-channel maths is covered by the Rust unit tests.
+### Real-audio check on the device
+
+With a guitar connected to `INPUT 2`, the operator lowered the Channel 2 fader to 0% and the
+guitar left the mix while the rest of the stream continued, then returned when the fader went
+back to 100%. The operator was asked to report the opposite outcome (the whole mix disappearing
+instead) and did not.
+
+This closes the link the protocol probe left open. Had the client not sent the gain table, the
+server would have kept its previous gains and the fader would have had no audible effect at all.
+The guitar leaving on its own channel also confirms the mapping — source channel `k` to output
+slot `k` — on real audio rather than on synthetic vectors.
+
+Still not measured: no bit-level or RMS comparison of the per-channel output, and no two-device
+run for this increment. The per-channel maths is covered by the Rust unit tests above.
 
 Process note worth keeping: the release binary had not been rebuilt after the server change, so
 the first protocol probe returned a stale acknowledgement without `channels`. The stale binary
