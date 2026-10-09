@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
 import android.widget.CheckBox
+import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import okhttp3.OkHttpClient
@@ -15,6 +16,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -31,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var stopButton: Button
     private lateinit var statusText: TextView
     private lateinit var controlStatusText: TextView
+    private lateinit var channelContainer: LinearLayout
     private lateinit var statsText: TextView
     private lateinit var errorText: TextView
     private lateinit var volumeSeekBar: SeekBar
@@ -47,6 +50,7 @@ class MainActivity : Activity() {
     @Volatile private var controlError = "none"
     @Volatile private var controlState = ControlState.IDLE
     @Volatile private var mixAcknowledged = false
+    @Volatile private var channelGains: IntArray = IntArray(0)
     @Volatile private var volumePercent = 100
     @Volatile private var maxLevelPercent = 100
     @Volatile private var muted = false
@@ -100,6 +104,7 @@ class MainActivity : Activity() {
         stopButton = findViewById(R.id.stopButton)
         statusText = findViewById(R.id.statusText)
         controlStatusText = findViewById(R.id.controlStatusText)
+        channelContainer = findViewById(R.id.channelContainer)
         statsText = findViewById(R.id.statsText)
         errorText = findViewById(R.id.errorText)
         volumeSeekBar = findViewById(R.id.volumeSeekBar)
@@ -235,9 +240,12 @@ class MainActivity : Activity() {
 
                     try {
                         val packet = PmonPacketParser.parse(datagram.data, datagram.length)
-                        if (packet.channels != 2) {
-                            throw PmonPacketParseException("only stereo PMON packets are supported")
+                        if (packet.channels > MAX_CHANNELS) {
+                            throw PmonPacketParseException(
+                                "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
+                            )
                         }
+                        syncChannelControls(packet.channels)
                         if (expectedSequence != null && packet.sequence > expectedSequence!!) {
                             sequencesLost += packet.sequence - expectedSequence!!
                         }
@@ -271,6 +279,7 @@ class MainActivity : Activity() {
 
                         val processedSamples = Pcm16Processor.applyLocalProtection(
                             samples = packet.samples,
+                            channelGains = channelGains,
                             volumePercent = volumePercent,
                             maxLevelPercent = maxLevelPercent,
                             muted = muted,
@@ -432,17 +441,55 @@ class MainActivity : Activity() {
     private fun sendMixControl() {
         controlExecutor.execute {
             val webSocket = controlWebSocket ?: return@execute
+            val gains = channelGains
+            val channels = JSONArray()
+            for (index in gains.indices) {
+                channels.put(gains[index])
+            }
             val message = JSONObject()
                 .put("type", "mix")
                 .put("volume_percent", volumePercent)
                 .put("max_level_percent", maxLevelPercent)
                 .put("muted", muted)
+                .put("channels", channels)
                 .toString()
             if (!webSocket.send(message) && running.get()) {
                 showControlError("WebSocket rejected mix update")
             }
         }
     }
+
+    private fun syncChannelControls(channels: Int) {
+        if (channelGains.size == channels) return
+        channelGains = IntArray(channels) { 100 }
+        runOnUiThread { rebuildChannelControls(channels) }
+    }
+
+    private fun rebuildChannelControls(channels: Int) {
+        channelContainer.removeAllViews()
+        for (index in 0 until channels) {
+            val label = TextView(this).apply { text = channelLabel(index, 100) }
+            val seekBar = SeekBar(this).apply {
+                max = 100
+                progress = 100
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        label.text = channelLabel(index, progress)
+                        channelGains = channelGains.copyOf().also { it[index] = progress }
+                        sendMixControl()
+                    }
+
+                    override fun onStartTrackingTouch(bar: SeekBar?) = Unit
+
+                    override fun onStopTrackingTouch(bar: SeekBar?) = Unit
+                })
+            }
+            channelContainer.addView(label)
+            channelContainer.addView(seekBar)
+        }
+    }
+
+    private fun channelLabel(index: Int, percent: Int): String = "Channel ${index + 1}: $percent%"
 
     override fun onDestroy() {
         stopReceiver()
@@ -453,3 +500,5 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 }
+
+private const val MAX_CHANNELS = 32

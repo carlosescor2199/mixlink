@@ -90,8 +90,8 @@ entries the client sent. A client applies the entries it has faders for and igno
 
 - [x] T1: Add the per-channel gain matrix to the server mix state and apply it in the mix path, preserving current output at 100%, with pure tests.
 - [x] T2: Extend the control protocol with the optional `channels` array and echo it in the acknowledgement, with parsing tests.
-- [ ] T3: Add one fader per announced channel to the Android client and send the matrix with each mix update.
-- [ ] T4: Run the workspace and Android checks, then validate the per-channel path end to end on the device.
+- [x] T3: Add one fader per announced channel to the Android client and send the matrix with each mix update.
+- [x] T4: Run the workspace and Android checks, then validate the per-channel path end to end on the device.
 
 ## Verification
 
@@ -109,6 +109,39 @@ Design note recorded while testing: a neutral gain table is not bit-identical fo
 which the full-scale ceiling clamps to `-32767`, exactly as the pre-change code did. The
 pass-through guarantee is therefore "identical to the previous implementation", which is what
 the change had to preserve.
+
+### T3
+
+- RED observed first: `No parameter with name 'channelGains' found` in all six processor tests
+  before the parameter existed.
+- `gradle test assembleDebug`: passed, 14 Android JVM tests, 0 failures
+  (`Pcm16ProcessorTest` 6, `ControlStatusTest` 5, `PmonPacketTest` 3).
+- The client now accepts any announced channel count up to 32 instead of rejecting anything that
+  is not stereo, and builds one labelled fader per announced channel when the count changes.
+
+### T4
+
+Protocol verified against the **rebuilt** release binary over a real WebSocket connection, with
+`127.0.0.1` added as a second target so a local client has its own mix state:
+
+| Sent | Acknowledgement |
+| --- | --- |
+| `channels:[150,-20,100]` | `vol=80 max=90 channels=[100,0,100,100,...]`, 32 entries |
+| no `channels` field | `channels=[100,0,100,100,...]`, previous gains preserved |
+| 33 gains | `type=error`, request rejected |
+
+On-device on SM-S916B: two labelled faders rendered automatically from the announced channel
+count, `Status: Receiving`, `Control: connected - mix applied on the server`, 719 packets,
+0 sequences lost, 48000 Hz, no errors.
+
+Not verified: the phone's outbound JSON was not independently captured, so "a fader movement
+reaches the server" rests on the client code path plus the protocol verification above rather
+than on an observed message. No acoustic or bit-level comparison of two clients' per-channel
+output was made; the per-channel maths is covered by the Rust unit tests.
+
+Process note worth keeping: the release binary had not been rebuilt after the server change, so
+the first protocol probe returned a stale acknowledgement without `channels`. The stale binary
+was discarded and the probe repeated, not interpreted.
 
 ## Acceptance Checks
 
@@ -140,5 +173,7 @@ no chain unless the implementation grows.
 
 ## Known Limitation
 
-Unlike M1, this increment has **not** been validated with a two-device run at the time of
-writing; see each task's verification notes.
+This increment has not been validated with a two-device run. With the two-channel Volt 4 the
+per-channel control covers two source positions, which behaves like a balance control rather
+than a true per-musician blend; a genuine blend needs one source per channel on a multichannel
+interface. Pan remains unimplemented.
