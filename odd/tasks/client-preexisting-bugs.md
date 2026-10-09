@@ -88,7 +88,29 @@ WebSocket lifecycle with no JVM coverage, `clearMixOwnership` is a one-line sett
 
 ### C4
 
-Not done. The three behaviours have not been seen on a device.
+Verified on the device with the server stopped, which is what makes the behaviour observable:
+
+- **Bug 3**: `Status: Starting on UDP port 50000; control port 50001` stayed on screen instead of
+  being repainted as `Receiving`. That is exactly the lie the fix removes: the client used to claim
+  it was receiving while zero packets arrived, which also made the status useless as a diagnostic.
+- **Bug 2**: the session before this test had been acknowledged, so the ownership flag was set. On
+  the next Start, with the control channel unavailable, the status line read
+  `unavailable - mixing on this device`. Without the fix it would have read
+  `channel lost - mix held at the server's last setting`, because the stale flag would have
+  survived. The label is derived from the same flag that decides whether the local fallback applies,
+  so the reading also confirms the master volume stays live.
+- **Bug 1**: **not verified.** It triggers when the channel count shrinks and the designated musician
+  channel falls out of range, and the Volt 4 always announces two channels, so it cannot be provoked
+  on this rig. It remains verified by code reading only, and that is stated rather than implied.
+
+Making bug 3 observable took a trick worth recording: `Status: Starting...` is normally visible for
+only a few milliseconds before the first packet repaints it, so the test was run with the server
+stopped. The absence of packets is what makes the fixed behaviour visible, and it is also the
+condition in which the old behaviour was actively wrong.
+
+A practical note for the next session: the view scrolls, and a tap aimed at `START` using
+top-of-page coordinates silently lands somewhere else when the page is scrolled down. Read the bounds
+from `uiautomator dump` in the current scroll position instead of reusing remembered coordinates.
 
 ## Acceptance Criteria
 
