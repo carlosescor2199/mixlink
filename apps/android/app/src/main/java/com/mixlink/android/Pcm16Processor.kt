@@ -17,4 +17,24 @@ object Pcm16Processor {
         }
         return output
     }
+
+    /**
+     * Returns the samples to play for one received packet.
+     *
+     * When the remote control channel is active the server has already applied volume,
+     * ceiling and mute for this client IP, so local processing is skipped to avoid
+     * applying the same gain twice. Local processing stays as the fallback for when no
+     * control channel is available.
+     */
+    fun applyLocalProtection(
+        samples: ShortArray,
+        volumePercent: Int,
+        maxLevelPercent: Int,
+        muted: Boolean,
+        remoteControlActive: Boolean,
+    ): ShortArray = if (remoteControlActive) {
+        samples
+    } else {
+        apply(samples, volumePercent, maxLevelPercent, muted)
+    }
 }

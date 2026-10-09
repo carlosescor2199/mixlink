@@ -27,4 +27,32 @@ class Pcm16ProcessorTest {
 
         assertArrayEquals(shortArrayOf(0, 0, 0), output)
     }
+
+    @Test
+    fun skipsLocalProcessingWhenRemoteControlOwnsTheMix() {
+        val samples = shortArrayOf(-16_000, 0, 16_000)
+
+        val output = Pcm16Processor.applyLocalProtection(
+            samples = samples,
+            volumePercent = 0,
+            maxLevelPercent = 25,
+            muted = true,
+            remoteControlActive = true,
+        )
+
+        assertArrayEquals(samples, output)
+    }
+
+    @Test
+    fun appliesLocalProcessingWhenRemoteControlIsUnavailable() {
+        val output = Pcm16Processor.applyLocalProtection(
+            samples = shortArrayOf(-16_000, 16_000),
+            volumePercent = 50,
+            maxLevelPercent = 100,
+            muted = false,
+            remoteControlActive = false,
+        )
+
+        assertArrayEquals(shortArrayOf(-8_000, 8_000), output)
+    }
 }

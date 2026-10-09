@@ -251,11 +251,12 @@ class MainActivity : Activity() {
                             )
                         }
 
-                        val processedSamples = Pcm16Processor.apply(
-                            packet.samples,
-                            volumePercent,
-                            maxLevelPercent,
-                            muted,
+                        val processedSamples = Pcm16Processor.applyLocalProtection(
+                            samples = packet.samples,
+                            volumePercent = volumePercent,
+                            maxLevelPercent = maxLevelPercent,
+                            muted = muted,
+                            remoteControlActive = controlWebSocket != null,
                         )
                         val writtenSamples = audioTrack.write(
                             processedSamples,
