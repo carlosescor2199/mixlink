@@ -28,6 +28,7 @@ const CHANNEL_CAPACITY: usize = 8;
 const HEADER_SIZE: usize = 4 + 1 + 1 + 4 + 8 + 2;
 const MAX_SAMPLES_PER_PACKET: usize = u16::MAX as usize;
 const MAX_MIX_CHANNELS: usize = 32;
+const OUTPUT_CHANNELS: u8 = 2;
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 
 struct Arguments {
@@ -50,6 +51,7 @@ struct PacketStats {
 
 struct MixState {
     channel_gains: [AtomicU8; MAX_MIX_CHANNELS],
+    pans: [AtomicU8; MAX_MIX_CHANNELS],
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
@@ -58,6 +60,7 @@ struct MixState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MixValues {
     channel_gains: [u8; MAX_MIX_CHANNELS],
+    pans: [u8; MAX_MIX_CHANNELS],
     volume_percent: u8,
     max_level_percent: u8,
     muted: bool,
@@ -72,6 +75,8 @@ struct MixCommand {
     muted: bool,
     #[serde(default)]
     channels: Option<Vec<i32>>,
+    #[serde(default)]
+    pans: Option<Vec<i32>>,
 }
 
 #[derive(Serialize)]
@@ -82,6 +87,15 @@ struct MixAck {
     max_level_percent: u8,
     muted: bool,
     channels: Vec<u8>,
+    pans: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct ControlConfig {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    source_channels: u8,
+    sample_rate: u32,
 }
 
 #[derive(Serialize)]
@@ -136,10 +150,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stopped = Arc::new(AtomicBool::new(false));
     let mix_states = build_mix_states(&targets)?;
+    let source_channels = supported_config.channels().min(u16::from(u8::MAX)) as u8;
     let control_thread = spawn_control_thread(
         arguments.control_port,
         Arc::clone(&mix_states),
         Arc::clone(&stopped),
+        source_channels,
     );
     let (packet_sender, packet_receiver) = sync_channel(CHANNEL_CAPACITY);
     let packet_stats = Arc::new(PacketStats {
@@ -489,10 +505,21 @@ fn enqueue_packet(
     }
 }
 
+/// Default pan keeps the captured interleaved layout: even sources hard left, odd sources hard
+/// right. With two sources and neutral gains this reproduces the pre-pan output exactly.
+fn default_pan(index: usize) -> u8 {
+    if index % 2 == 0 {
+        0
+    } else {
+        100
+    }
+}
+
 impl Default for MixState {
     fn default() -> Self {
         Self {
             channel_gains: std::array::from_fn(|_| AtomicU8::new(100)),
+            pans: std::array::from_fn(|index| AtomicU8::new(default_pan(index))),
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
@@ -504,6 +531,7 @@ impl Default for MixValues {
     fn default() -> Self {
         Self {
             channel_gains: [100; MAX_MIX_CHANNELS],
+            pans: std::array::from_fn(default_pan),
             volume_percent: 100,
             max_level_percent: 100,
             muted: false,
@@ -511,15 +539,16 @@ impl Default for MixValues {
     }
 }
 
+fn store_all(slots: &[AtomicU8; MAX_MIX_CHANNELS], values: &[u8; MAX_MIX_CHANNELS]) {
+    for (slot, value) in slots.iter().zip(values.iter().copied()) {
+        slot.store(value, Ordering::Relaxed);
+    }
+}
+
 impl MixState {
     fn update(&self, values: MixValues) {
-        for (slot, gain) in self
-            .channel_gains
-            .iter()
-            .zip(values.channel_gains.iter().copied())
-        {
-            slot.store(gain, Ordering::Relaxed);
-        }
+        store_all(&self.channel_gains, &values.channel_gains);
+        store_all(&self.pans, &values.pans);
         self.volume_percent
             .store(values.volume_percent, Ordering::Relaxed);
         self.max_level_percent
@@ -532,6 +561,7 @@ impl MixState {
             channel_gains: std::array::from_fn(|index| {
                 self.channel_gains[index].load(Ordering::Relaxed)
             }),
+            pans: std::array::from_fn(|index| self.pans[index].load(Ordering::Relaxed)),
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
@@ -548,57 +578,98 @@ fn parse_mix_command(json: &str, current: MixValues) -> Result<MixValues, String
         ));
     }
 
-    let channel_gains = match command.channels.as_ref() {
-        None => current.channel_gains,
-        Some(channels) => {
-            if channels.len() > MAX_MIX_CHANNELS {
-                return Err(format!(
-                    "channels accepts at most {MAX_MIX_CHANNELS} gains, received {}",
-                    channels.len()
-                ));
-            }
-            let mut gains = current.channel_gains;
-            for (slot, value) in gains.iter_mut().zip(channels.iter()) {
-                *slot = (*value).clamp(0, 100) as u8;
-            }
-            gains
-        }
-    };
+    let channel_gains = merge_levels(
+        "channels",
+        command.channels.as_ref(),
+        &current.channel_gains,
+    )?;
+    let pans = merge_levels("pans", command.pans.as_ref(), &current.pans)?;
 
     Ok(MixValues {
         channel_gains,
+        pans,
         volume_percent: command.volume_percent.clamp(0, 100) as u8,
         max_level_percent: command.max_level_percent.clamp(0, 100) as u8,
         muted: command.muted,
     })
 }
 
-/// Applies one client's mix to an interleaved PCM buffer.
+/// Merges an optional list of 0-100 values into an existing table.
 ///
-/// Source channel `k` maps to output slot `k`, so a buffer whose gains are all 100% is passed
-/// through unchanged, apart from the full-scale ceiling clamp that also applied before this
-/// change (`i16::MIN` becomes `-32767`). Master volume, mute and the ceiling are applied on top
-/// of the per-channel gains.
-fn apply_mix(samples: &mut [i16], channels: usize, values: MixValues) {
-    if channels == 0 {
-        return;
+/// An absent list preserves the current values, so a client that does not send the field keeps
+/// working. Values are clamped; an oversized list is rejected rather than silently truncated.
+fn merge_levels(
+    label: &str,
+    incoming: Option<&Vec<i32>>,
+    current: &[u8; MAX_MIX_CHANNELS],
+) -> Result<[u8; MAX_MIX_CHANNELS], String> {
+    let Some(values) = incoming else {
+        return Ok(*current);
+    };
+    if values.len() > MAX_MIX_CHANNELS {
+        return Err(format!(
+            "{label} accepts at most {MAX_MIX_CHANNELS} values, received {}",
+            values.len()
+        ));
     }
 
+    let mut merged = *current;
+    for (slot, value) in merged.iter_mut().zip(values.iter()) {
+        *slot = (*value).clamp(0, 100) as u8;
+    }
+    Ok(merged)
+}
+
+/// Equal-power pan law, the console standard: `theta` runs from 0 at hard left to `PI/2` at
+/// hard right, so a centred source contributes about `0.707` to each output.
+fn pan_gains(pan: u8) -> (f32, f32) {
+    let theta = (f32::from(pan) / 100.0) * std::f32::consts::FRAC_PI_2;
+    (theta.cos(), theta.sin())
+}
+
+fn clamp_sample(value: f32, ceiling: f32) -> i16 {
+    value
+        .clamp(-ceiling, ceiling)
+        .round()
+        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+/// Mixes one client's interleaved source buffer down to a stereo bus.
+///
+/// Every source channel contributes to both outputs weighted by its pan, so source channel `k`
+/// is no longer bound to output slot `k`. The default pan table keeps the captured layout (even
+/// sources hard left, odd sources hard right), which with neutral gains on a two-channel source
+/// reproduces the pre-pan output exactly, apart from the full-scale ceiling clamp that also
+/// applied before. Master volume, mute and the ceiling are applied after the sum.
+fn mix_channels(source: &[i16], channels: usize, values: MixValues) -> Vec<i16> {
+    if channels == 0 || source.len() < channels {
+        return source.to_vec();
+    }
+
+    let frames = source.len() / channels;
+    let active = channels.min(MAX_MIX_CHANNELS);
     let ceiling = (i32::from(i16::MAX) * i32::from(values.max_level_percent) / 100) as f32;
     let master = f32::from(values.volume_percent) / 100.0;
-    for (index, sample) in samples.iter_mut().enumerate() {
-        let channel = (index % channels).min(MAX_MIX_CHANNELS - 1);
-        let channel_gain = f32::from(values.channel_gains[channel]) / 100.0;
-        let scaled = if values.muted {
-            0.0
-        } else {
-            f32::from(*sample) * channel_gain * master
-        };
-        *sample = scaled
-            .clamp(-ceiling, ceiling)
-            .round()
-            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+    let mut output = vec![0i16; frames * usize::from(OUTPUT_CHANNELS)];
+
+    for frame in 0..frames {
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for channel in 0..active {
+            let gain = f32::from(values.channel_gains[channel]) / 100.0 * master;
+            if gain == 0.0 || values.muted {
+                continue;
+            }
+            let sample = f32::from(source[frame * channels + channel]);
+            let (left_weight, right_weight) = pan_gains(values.pans[channel]);
+            left += sample * gain * left_weight;
+            right += sample * gain * right_weight;
+        }
+        output[frame * 2] = clamp_sample(left, ceiling);
+        output[frame * 2 + 1] = clamp_sample(right, ceiling);
     }
+
+    output
 }
 
 fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
@@ -608,6 +679,7 @@ fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
         max_level_percent: values.max_level_percent,
         muted: values.muted,
         channels: values.channel_gains.to_vec(),
+        pans: values.pans.to_vec(),
     })
 }
 
@@ -622,6 +694,7 @@ fn spawn_control_thread(
     control_port: u16,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     stopped: Arc<AtomicBool>,
+    source_channels: u8,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let listener = match std::net::TcpListener::bind(("0.0.0.0", control_port)) {
@@ -645,7 +718,12 @@ fn spawn_control_thread(
                 return;
             }
         };
-        runtime.block_on(run_control_server(listener, mix_states, stopped));
+        runtime.block_on(run_control_server(
+            listener,
+            mix_states,
+            stopped,
+            source_channels,
+        ));
     })
 }
 
@@ -653,6 +731,7 @@ async fn run_control_server(
     listener: std::net::TcpListener,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     stopped: Arc<AtomicBool>,
+    source_channels: u8,
 ) {
     let listener = match TcpListener::from_std(listener) {
         Ok(listener) => listener,
@@ -675,7 +754,9 @@ async fn run_control_server(
                 Ok((stream, peer)) => {
                     let states = Arc::clone(&mix_states);
                     tokio::spawn(async move {
-                        if let Err(error) = handle_control_connection(stream, peer, states).await {
+                        if let Err(error) =
+                            handle_control_connection(stream, peer, states, source_channels).await
+                        {
                             eprintln!("control connection {peer} error: {error}");
                         }
                     });
@@ -690,9 +771,16 @@ async fn handle_control_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
+    source_channels: u8,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = accept_async(stream).await?;
     let (mut writer, mut reader) = websocket.split();
+    let config = serde_json::to_string(&ControlConfig {
+        message_type: "config",
+        source_channels,
+        sample_rate: TARGET_SAMPLE_RATE,
+    })?;
+    writer.send(Message::Text(config.into())).await?;
     while let Some(message) = reader.next().await {
         let message = message?;
         match message {
@@ -786,17 +874,16 @@ fn spawn_network_thread(
     Ok(thread::spawn(move || {
         for packet in packet_receiver {
             for target in &targets {
-                let mut samples = packet.samples.clone();
                 let mix_state = mix_states
                     .get(&target.ip())
                     .expect("every target must have a mix state");
-                apply_mix(
-                    &mut samples,
+                let samples = mix_channels(
+                    &packet.samples,
                     usize::from(packet.channels),
                     mix_state.snapshot(),
                 );
                 let target_packet = AudioPacket {
-                    channels: packet.channels,
+                    channels: OUTPUT_CHANNELS,
                     sample_rate: packet.sample_rate,
                     sequence: packet.sequence,
                     samples,
@@ -994,18 +1081,16 @@ mod tests {
             .update(MixValues::default());
 
         let input = [20_000, -20_000];
-        let mut first_output = input;
-        let mut second_output = input;
-        apply_mix(
-            &mut first_output,
+        let first_output = mix_channels(
+            &input,
             2,
             states
                 .get(&"192.168.1.3".parse().unwrap())
                 .unwrap()
                 .snapshot(),
         );
-        apply_mix(
-            &mut second_output,
+        let second_output = mix_channels(
+            &input,
             2,
             states
                 .get(&"192.168.1.4".parse().unwrap())
@@ -1081,8 +1166,7 @@ mod tests {
         assert_eq!(values.volume_percent, 100);
         assert_eq!(values.max_level_percent, 25);
 
-        let mut samples = [i16::MIN, -16_000, 16_000, i16::MAX];
-        apply_mix(&mut samples, 2, values);
+        let samples = mix_channels(&[i16::MIN, -16_000, 16_000, i16::MAX], 2, values);
         assert_eq!(samples, [-8191, -8191, 8191, 8191]);
     }
 
@@ -1093,9 +1177,8 @@ mod tests {
             MixValues::default(),
         )
         .unwrap();
-        let mut samples = [i16::MIN, 0, i16::MAX];
-        apply_mix(&mut samples, 2, values);
-        assert_eq!(samples, [0, 0, 0]);
+        let samples = mix_channels(&[i16::MIN, 0, i16::MAX, 100], 2, values);
+        assert_eq!(samples, [0, 0, 0, 0]);
         assert!(parse_mix_command(
             r#"{"type":"status","volume_percent":80,"max_level_percent":90,"muted":false}"#,
             MixValues::default(),
@@ -1104,11 +1187,10 @@ mod tests {
     }
 
     #[test]
-    fn neutral_channel_gains_leave_the_buffer_unchanged() {
-        let mut samples = [-16_000, -8_000, 8_000, 16_000];
-        let original = samples;
+    fn neutral_channel_gains_and_default_pans_leave_the_buffer_unchanged() {
+        let original = [-16_000, -8_000, 8_000, 16_000];
 
-        apply_mix(&mut samples, 2, MixValues::default());
+        let samples = mix_channels(&original, 2, MixValues::default());
 
         assert_eq!(samples, original);
     }
@@ -1125,8 +1207,7 @@ mod tests {
             ..MixValues::default()
         };
 
-        let mut samples = [10_000, 10_000, -10_000, -10_000];
-        apply_mix(&mut samples, 2, values);
+        let samples = mix_channels(&[10_000, 10_000, -10_000, -10_000], 2, values);
 
         assert_eq!(samples, [10_000, 5_000, -10_000, -5_000]);
     }
@@ -1178,5 +1259,76 @@ mod tests {
 
         assert!(ack.contains(r#""type":"mix_ack""#));
         assert!(ack.contains(r#""channels":[100,40,100"#));
+    }
+
+    #[test]
+    fn centring_a_source_places_it_in_both_outputs() {
+        let values = MixValues {
+            pans: std::array::from_fn(|_| 50),
+            ..MixValues::default()
+        };
+
+        let samples = mix_channels(&[10_000, 0], 2, values);
+
+        // cos(PI/4) == sin(PI/4), so both outputs get the same share.
+        assert_eq!(samples, [7_071, 7_071]);
+    }
+
+    #[test]
+    fn panning_everything_left_empties_the_right_output() {
+        let values = MixValues {
+            pans: std::array::from_fn(|_| 0),
+            ..MixValues::default()
+        };
+
+        let samples = mix_channels(&[10_000, -4_000], 2, values);
+
+        assert_eq!(samples, [6_000, 0]);
+    }
+
+    #[test]
+    fn a_multichannel_source_is_summed_into_a_stereo_output() {
+        let samples = mix_channels(&[1_000, 2_000, 3_000, 4_000], 4, MixValues::default());
+
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples, [4_000, 6_000]);
+    }
+
+    #[test]
+    fn absent_pans_field_preserves_existing_pans_and_oversized_lists_are_rejected() {
+        let current = MixValues {
+            pans: std::array::from_fn(|index| if index == 0 { 25 } else { 75 }),
+            ..MixValues::default()
+        };
+
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#,
+            current,
+        )
+        .unwrap();
+        assert_eq!(values.pans, current.pans);
+
+        let clamped = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"pans":[150,-5,50]}"#,
+            current,
+        )
+        .unwrap();
+        assert_eq!(&clamped.pans[..3], &[100, 0, 50]);
+
+        let oversized = format!(
+            r#"{{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"pans":[{}]}}"#,
+            vec!["50"; MAX_MIX_CHANNELS + 1].join(",")
+        );
+        assert!(parse_mix_command(&oversized, current).is_err());
+    }
+
+    #[test]
+    fn default_pan_reproduces_the_captured_interleaved_layout() {
+        let values = MixValues::default();
+
+        assert_eq!(values.pans[0], 0);
+        assert_eq!(values.pans[1], 100);
+        assert_eq!(values.pans[2], 0);
+        assert_eq!(values.pans[3], 100);
     }
 }
