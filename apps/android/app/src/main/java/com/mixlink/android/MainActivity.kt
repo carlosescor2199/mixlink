@@ -53,6 +53,8 @@ class MainActivity : Activity() {
     @Volatile private var sourceChannels = 0
     @Volatile private var channelGains: IntArray = IntArray(0)
     @Volatile private var channelPans: IntArray = IntArray(0)
+    @Volatile private var channelMutes: BooleanArray = BooleanArray(0)
+    @Volatile private var channelSolos: BooleanArray = BooleanArray(0)
     @Volatile private var volumePercent = 100
     @Volatile private var maxLevelPercent = 100
     @Volatile private var muted = false
@@ -449,6 +451,8 @@ class MainActivity : Activity() {
             val webSocket = controlWebSocket ?: return@execute
             val gains = channelGains
             val pans = channelPans
+            val mutes = channelMutes
+            val solos = channelSolos
             val channels = JSONArray()
             for (index in gains.indices) {
                 channels.put(gains[index])
@@ -457,6 +461,14 @@ class MainActivity : Activity() {
             for (index in pans.indices) {
                 panLevels.put(pans[index])
             }
+            val muteFlags = JSONArray()
+            for (index in mutes.indices) {
+                muteFlags.put(mutes[index])
+            }
+            val soloFlags = JSONArray()
+            for (index in solos.indices) {
+                soloFlags.put(solos[index])
+            }
             val message = JSONObject()
                 .put("type", "mix")
                 .put("volume_percent", volumePercent)
@@ -464,6 +476,8 @@ class MainActivity : Activity() {
                 .put("muted", muted)
                 .put("channels", channels)
                 .put("pans", panLevels)
+                .put("mutes", muteFlags)
+                .put("solos", soloFlags)
                 .toString()
             if (!webSocket.send(message) && running.get()) {
                 showControlError("WebSocket rejected mix update")
@@ -476,6 +490,8 @@ class MainActivity : Activity() {
         sourceChannels = channels
         channelGains = IntArray(channels) { 100 }
         channelPans = IntArray(channels) { index -> defaultPan(index) }
+        channelMutes = BooleanArray(channels)
+        channelSolos = BooleanArray(channels)
         runOnUiThread { rebuildChannelControls(channels) }
     }
 
@@ -519,6 +535,24 @@ class MainActivity : Activity() {
             channelContainer.addView(gainSeekBar)
             channelContainer.addView(panLabelView)
             channelContainer.addView(panSeekBar)
+            val muteCheckBox = CheckBox(this).apply {
+                text = "Mute ${index + 1}"
+                isChecked = channelMutes.getOrElse(index) { false }
+                setOnCheckedChangeListener { _, checked ->
+                    channelMutes = channelMutes.copyOf().also { it[index] = checked }
+                    sendMixControl()
+                }
+            }
+            val soloCheckBox = CheckBox(this).apply {
+                text = "Solo ${index + 1}"
+                isChecked = channelSolos.getOrElse(index) { false }
+                setOnCheckedChangeListener { _, checked ->
+                    channelSolos = channelSolos.copyOf().also { it[index] = checked }
+                    sendMixControl()
+                }
+            }
+            channelContainer.addView(muteCheckBox)
+            channelContainer.addView(soloCheckBox)
         }
     }
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::mix::{merge_levels, MixValues};
+use crate::mix::{merge_flags, merge_levels, MixValues};
 
 const PACKET_MAGIC: [u8; 4] = *b"PMON";
 const PACKET_VERSION: u8 = 1;
@@ -24,6 +24,10 @@ pub(crate) struct MixCommand {
     pub(crate) channels: Option<Vec<i32>>,
     #[serde(default)]
     pub(crate) pans: Option<Vec<i32>>,
+    #[serde(default)]
+    pub(crate) mutes: Option<Vec<bool>>,
+    #[serde(default)]
+    pub(crate) solos: Option<Vec<bool>>,
 }
 
 /// Parses a `mix` control message and merges it into the client's current values.
@@ -45,10 +49,14 @@ pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixVal
         &current.channel_gains,
     )?;
     let pans = merge_levels("pans", command.pans.as_ref(), &current.pans)?;
+    let channel_muted = merge_flags("mutes", command.mutes.as_ref(), &current.channel_muted)?;
+    let channel_solo = merge_flags("solos", command.solos.as_ref(), &current.channel_solo)?;
 
     Ok(MixValues {
         channel_gains,
         pans,
+        channel_muted,
+        channel_solo,
         volume_percent: command.volume_percent.clamp(0, 100) as u8,
         max_level_percent: command.max_level_percent.clamp(0, 100) as u8,
         muted: command.muted,
@@ -64,6 +72,8 @@ struct MixAck {
     muted: bool,
     channels: Vec<u8>,
     pans: Vec<u8>,
+    mutes: Vec<bool>,
+    solos: Vec<bool>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +115,8 @@ pub(crate) fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
         muted: values.muted,
         channels: values.channel_gains.to_vec(),
         pans: values.pans.to_vec(),
+        mutes: values.channel_muted.to_vec(),
+        solos: values.channel_solo.to_vec(),
     })
 }
 
