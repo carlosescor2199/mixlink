@@ -88,8 +88,28 @@ Acknowledgement:
 
 - [x] P1: Server stereo bus with per-source gain and equal-power pan, defaulting to the current layout, with pure tests.
 - [x] P2: Protocol `pans` array plus the `config` message, with parsing tests and a live WebSocket probe.
-- [ ] P3: Android pan controls per channel, source count from `config`, and pan in the local fallback.
+- [x] P3: Android pan controls per channel, the source count taken from `config`, and the local fallback reduced to master controls because the received stream is already the server's stereo output.
 - [ ] P4: Real-audio check on the device with the guitar, then the workspace and Android checks.
+
+## Consequence for the Client
+
+Once the server sums into a stereo bus, the client receives an **already mixed** stereo stream.
+`AudioPacket.channels` is therefore 2, and the client can no longer see the individual sources.
+
+Two things follow, and both are deliberate rather than accidental:
+
+1. The channel count that drives the client controls must come from the `config` message, not
+   from `packet.channels`. Reading it from the audio packet would show two faders forever.
+2. The local fallback can only apply master volume, mute and the ceiling. It cannot apply the
+   per-channel gains or the pans, because the audio it holds is the finished mix; there is
+   nothing left to pan. The per-channel gains that the local path applied after the previous
+   increment must therefore be removed from it.
+
+The honest limitation that follows: **per-source control requires a working control channel.**
+If the control port is unreachable while UDP audio flows, a musician keeps master volume, mute
+and the ceiling, and their per-channel faders do nothing until the control channel comes back.
+Making per-source control work without the control channel would mean shipping raw multichannel
+audio to every client, which is a different architecture and a much larger bandwidth budget.
 
 ## Verification
 
@@ -118,6 +138,23 @@ leaves the other alone.
 Process note: the release binary had to be rebuilt again before probing, and the running server
 holds a lock on it, so `cargo build --release` fails with `Acceso denegado (os error 5)` until
 the process is stopped.
+
+### P3
+
+- RED observed first: `No value passed for parameter 'channelGains'` at six call sites, in both
+  the debug and release unit-test compilation, after the tests moved to the corrected API.
+- `gradle test assembleDebug`: passed, 14 Android JVM tests, 0 failures. The orchestrator re-ran
+  the same command as a spot check and it agreed with the reported counts.
+- The client takes the source count from `config`, builds one fader and one pan control per
+  source, sends the `pans` array with every mix update, and mirrors the server's default pan
+  table so the first message after connect does not move any source.
+- The local fallback dropped the per-channel gains and applies master controls only, as the
+  "Consequence for the Client" section requires. `activity_main.xml` needed no change because
+  the pan controls are built into the existing `channelContainer`.
+
+Not verified for this half: nothing was run on a device. Per-source and pan behaviour through
+the app, including that a pan actually moves a source in the stereo field, is covered by P4 and
+has not been done yet.
 
 ## Acceptance Criteria
 

@@ -50,7 +50,9 @@ class MainActivity : Activity() {
     @Volatile private var controlError = "none"
     @Volatile private var controlState = ControlState.IDLE
     @Volatile private var mixAcknowledged = false
+    @Volatile private var sourceChannels = 0
     @Volatile private var channelGains: IntArray = IntArray(0)
+    @Volatile private var channelPans: IntArray = IntArray(0)
     @Volatile private var volumePercent = 100
     @Volatile private var maxLevelPercent = 100
     @Volatile private var muted = false
@@ -69,6 +71,12 @@ class MainActivity : Activity() {
                 val message = JSONObject(text)
                 when (message.optString("type")) {
                     "error" -> showControlError(message.optString("message", "unknown control error"))
+                    "config" -> {
+                        val announcedChannels = message.optInt("source_channels", -1)
+                        if (announcedChannels in 1..MAX_CHANNELS) {
+                            syncChannelControls(announcedChannels)
+                        }
+                    }
                     "mix_ack" -> {
                         mixAcknowledged = true
                         renderControlStatus()
@@ -245,7 +253,6 @@ class MainActivity : Activity() {
                                 "PMON packet announces ${packet.channels} channels, the limit is $MAX_CHANNELS",
                             )
                         }
-                        syncChannelControls(packet.channels)
                         if (expectedSequence != null && packet.sequence > expectedSequence!!) {
                             sequencesLost += packet.sequence - expectedSequence!!
                         }
@@ -279,7 +286,6 @@ class MainActivity : Activity() {
 
                         val processedSamples = Pcm16Processor.applyLocalProtection(
                             samples = packet.samples,
-                            channelGains = channelGains,
                             volumePercent = volumePercent,
                             maxLevelPercent = maxLevelPercent,
                             muted = muted,
@@ -442,9 +448,14 @@ class MainActivity : Activity() {
         controlExecutor.execute {
             val webSocket = controlWebSocket ?: return@execute
             val gains = channelGains
+            val pans = channelPans
             val channels = JSONArray()
             for (index in gains.indices) {
                 channels.put(gains[index])
+            }
+            val panLevels = JSONArray()
+            for (index in pans.indices) {
+                panLevels.put(pans[index])
             }
             val message = JSONObject()
                 .put("type", "mix")
@@ -452,6 +463,7 @@ class MainActivity : Activity() {
                 .put("max_level_percent", maxLevelPercent)
                 .put("muted", muted)
                 .put("channels", channels)
+                .put("pans", panLevels)
                 .toString()
             if (!webSocket.send(message) && running.get()) {
                 showControlError("WebSocket rejected mix update")
@@ -460,21 +472,23 @@ class MainActivity : Activity() {
     }
 
     private fun syncChannelControls(channels: Int) {
-        if (channelGains.size == channels) return
+        if (sourceChannels == channels && channelGains.size == channels) return
+        sourceChannels = channels
         channelGains = IntArray(channels) { 100 }
+        channelPans = IntArray(channels) { index -> defaultPan(index) }
         runOnUiThread { rebuildChannelControls(channels) }
     }
 
     private fun rebuildChannelControls(channels: Int) {
         channelContainer.removeAllViews()
         for (index in 0 until channels) {
-            val label = TextView(this).apply { text = channelLabel(index, 100) }
-            val seekBar = SeekBar(this).apply {
+            val gainLabel = TextView(this).apply { text = channelLabel(index, 100) }
+            val gainSeekBar = SeekBar(this).apply {
                 max = 100
                 progress = 100
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
-                        label.text = channelLabel(index, progress)
+                        gainLabel.text = channelLabel(index, progress)
                         channelGains = channelGains.copyOf().also { it[index] = progress }
                         sendMixControl()
                     }
@@ -484,12 +498,43 @@ class MainActivity : Activity() {
                     override fun onStopTrackingTouch(bar: SeekBar?) = Unit
                 })
             }
-            channelContainer.addView(label)
-            channelContainer.addView(seekBar)
+            val initialPan = channelPans.getOrElse(index) { defaultPan(index) }
+            val panLabelView = TextView(this).apply { text = panLabel(index, initialPan) }
+            val panSeekBar = SeekBar(this).apply {
+                max = 100
+                progress = initialPan
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        panLabelView.text = panLabel(index, progress)
+                        channelPans = channelPans.copyOf().also { it[index] = progress }
+                        sendMixControl()
+                    }
+
+                    override fun onStartTrackingTouch(bar: SeekBar?) = Unit
+
+                    override fun onStopTrackingTouch(bar: SeekBar?) = Unit
+                })
+            }
+            channelContainer.addView(gainLabel)
+            channelContainer.addView(gainSeekBar)
+            channelContainer.addView(panLabelView)
+            channelContainer.addView(panSeekBar)
         }
     }
 
     private fun channelLabel(index: Int, percent: Int): String = "Channel ${index + 1}: $percent%"
+
+    private fun panLabel(index: Int, percent: Int): String {
+        val position = when {
+            percent <= 0 -> "L"
+            percent >= 100 -> "R"
+            percent == 50 -> "C"
+            else -> "$percent%"
+        }
+        return "Pan ${index + 1}: $position"
+    }
+
+    private fun defaultPan(index: Int): Int = if (index % 2 == 0) 0 else 100
 
     override fun onDestroy() {
         stopReceiver()
