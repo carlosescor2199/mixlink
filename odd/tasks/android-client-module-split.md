@@ -91,6 +91,17 @@ Delegated: one bounded writer, with a very explicit instruction not to change be
 
 Roughly 700 moved lines across seven files. Almost all movement.
 
+## Device Confirmation
+
+The device session that followed is what verified this split behaviourally. On SM-S916B the app
+connected to the server, streamed audio, rendered every per-channel control, saved and recalled a
+bank, and exercised `More of me`, all through the reworked wiring.
+
+That matters because it is the first time the moved code ran at all. A build only proves the pieces
+compile together; it says nothing about whether the receive loop still receives, the socket still
+connects, or the control closures still reach the right state. The session is recorded here as the
+evidence, not the build.
+
 ## Known Limitation
 
 The split is verified by a build and by the device session that follows, not by unit tests, because

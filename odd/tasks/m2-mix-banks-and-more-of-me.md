@@ -104,8 +104,21 @@ force a poor solution, the surfaces should include the file that holds the prope
 
 ### B4
 
-Not done. Saving, recalling and `More of me` have not been exercised on a device; the pure logic is
-covered by the tests above but nobody has pressed the button.
+Verified on the device, on SM-S916B with a guitar on `INPUT 2`:
+
+- A bank was saved under a name and appeared in the list.
+- The mix was then deliberately changed and the bank recalled; the operator confirmed the faders,
+  the pan, the mutes and the solos all came back.
+- `More of me` was exercised with the guitar designated as the musician's channel.
+- The bank survived closing and reopening the app, which exercises the `SharedPreferences` load and
+  the JSON parse path: the newest and least covered code in this increment.
+
+The operator was asked to confirm the restore and the restart persistence separately rather than
+accepting a general "it works", because neither can be inferred from the rest working. In particular
+an in-memory-only store would have looked identical until the app was restarted.
+
+Not exercised: `More of me` with no channel designated. The unit tests cover the derivation
+returning null in that case, but nobody saw the UI refuse it.
 
 ## Known Problem Introduced Here
 
