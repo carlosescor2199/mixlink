@@ -168,12 +168,18 @@ has not been done yet.
 
 Two things were observed during this run and are **not resolved**:
 
-- Packet loss appeared where earlier runs had none: 20 sequences lost over 594 packets, about
-  3.4%, against the PRD target of 0.5%, plus 49920 discarded audio samples across 59 packets. The
-  measurement was taken while the orchestrator was also pulling screenshots and running a UDP
-  receiver, so it is **not** a clean baseline, and it could not be re-measured because the device
-  was disconnected first. Treat it as an open question, not a regression, until a quiet run is
-  taken.
+- Packet loss was left open after an early run showed 20 sequences lost over 594 packets, about
+  3.4%, against the PRD target of 0.5%. That measurement was contaminated: the orchestrator was
+  pulling screenshots and running a UDP receiver at the same time. A later window measured
+  **0 sequences lost over 22508 packets**, with 8.5-9.9 ms inter-arrival and 1.3-2.0 ms jitter.
+  That closes the question: there is no evidence of a loss regression from this change.
+- The first attempt at the clean window was itself invalidated because the operator pressed Stop
+  and Start mid-window, and the app does not restart the receiver on its own, so the run was
+  repeated. Recorded because the symptom (a stream that appears to stop by itself) initially
+  looked like a stability defect and was not one.
+- `Audio samples discarded` stayed low across the same window (2496 samples over 5 packets),
+  which is the expected consequence of the non-blocking low-latency write path rather than a
+  fault.
 - The captured level was low: the peak absolute sample in a sampled packet was 34 of 32767. The
   operator confirmed afterwards that the source had been disconnected at that moment, so this was
   silence rather than a gain problem. Not a finding.
