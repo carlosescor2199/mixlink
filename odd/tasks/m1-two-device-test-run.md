@@ -179,19 +179,40 @@ Verification:
 - `gradle -p apps/android test assembleDebug`: passed, APK rebuilt.
 - `cargo fmt --all -- --check`, `cargo test --workspace` (15 passed), `cargo check --workspace`: passed.
 
-## Remaining Edge Case - Control Channel Outage
+## Resolved Edge Case - Control Channel Outage
 
-The server keeps the last received `MixState` for a client IP when the WebSocket disconnects;
-it does not reset on disconnect. After the client falls back to local processing, the last
-server-side values are still applied, which reintroduces the squared gain for the duration of
-the outage.
+The server keeps the last mix it accepted for a client IP and keeps applying it after the
+control socket goes away. The client used to fall back to local processing whenever the socket
+was down, so the retained server-side values were applied a second time: a mix at 50% became
+25% for the duration of the outage.
 
-Resetting the server state to neutral on disconnect would close this, but it would also drop an
-engineer-set `Maximum level` ceiling at exactly the moment the client loses its control channel,
-which works against RF12. This is a product decision and is intentionally not implemented.
+Fix: ownership is decided by the server's acknowledgement, not by the socket state.
 
-Impact on this run: keep both devices connected for the whole session and note any WebSocket
-error in the evidence. An outage invalidates the absolute-level observations taken during it.
+- The client now reads the `mix_ack` the server was already sending and the client was
+  discarding.
+- `serverOwnsMix` becomes true once a mix has been acknowledged, and local processing is then
+  skipped permanently for the session. The server keeps applying that mix while the socket is
+  down and the client plays it unchanged, so the gain is applied exactly once in every case.
+- Local processing still applies when no mix was ever acknowledged, because the server is
+  holding its neutral default then. That keeps the device controllable when the control port is
+  unreachable while UDP audio still flows.
+
+The control status line states which side owns the mix: `connected - mix applied on the
+server`, `channel lost - mix held at the server's last setting`, or
+`unavailable - mixing on this device`.
+
+No server change was needed. Resetting the server state on disconnect was rejected because it
+would drop an engineer-set `Maximum level` ceiling at exactly the moment the client loses its
+control channel, which works against RF12.
+
+Verification:
+
+- Test-first: 5 new `ControlStatusTest` cases covering the ownership truth table, observed
+  failing as `Unresolved reference 'controlStatusLabel'` before the function existed.
+- `gradle test assembleDebug`: passed; 12 Android JVM tests, 0 failures.
+- On-device on SM-S916B: `connected - mix applied on the server` while the server was up, and
+  `channel lost - mix held at the server's last setting` after the server was killed, with the
+  client correctly keeping the server's mix instead of falling back to local processing.
 
 ## Constraints
 

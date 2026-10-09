@@ -46,6 +46,7 @@ class MainActivity : Activity() {
     @Volatile private var lastError = "none"
     @Volatile private var controlError = "none"
     @Volatile private var controlState = ControlState.IDLE
+    @Volatile private var mixAcknowledged = false
     @Volatile private var volumePercent = 100
     @Volatile private var maxLevelPercent = 100
     @Volatile private var muted = false
@@ -62,8 +63,12 @@ class MainActivity : Activity() {
         override fun onMessage(webSocket: WebSocket, text: String) {
             try {
                 val message = JSONObject(text)
-                if (message.optString("type") == "error") {
-                    showControlError(message.optString("message", "unknown control error"))
+                when (message.optString("type")) {
+                    "error" -> showControlError(message.optString("message", "unknown control error"))
+                    "mix_ack" -> {
+                        mixAcknowledged = true
+                        renderControlStatus()
+                    }
                 }
             } catch (error: Exception) {
                 showControlError("Invalid control response: ${error.message ?: "unknown error"}")
@@ -269,7 +274,7 @@ class MainActivity : Activity() {
                             volumePercent = volumePercent,
                             maxLevelPercent = maxLevelPercent,
                             muted = muted,
-                            remoteControlActive = controlWebSocket != null,
+                            serverOwnsMix = mixAcknowledged,
                         )
                         val writtenSamples = audioTrack.write(
                             processedSamples,
@@ -403,13 +408,7 @@ class MainActivity : Activity() {
     }
 
     private fun renderControlStatus() {
-        val label = when (controlState) {
-            ControlState.IDLE -> "not connected"
-            ControlState.CONNECTING -> "connecting..."
-            ControlState.CONNECTED -> "connected - mix applied on the server"
-            ControlState.UNAVAILABLE -> "unavailable - mixing on this device"
-            ControlState.CLOSED -> "closed - mixing on this device"
-        }
+        val label = controlStatusLabel(controlState, mixAcknowledged)
         runOnUiThread { controlStatusText.text = "Control: $label" }
     }
 
@@ -454,5 +453,3 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 }
-
-private enum class ControlState { IDLE, CONNECTING, CONNECTED, UNAVAILABLE, CLOSED }

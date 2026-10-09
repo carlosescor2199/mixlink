@@ -21,18 +21,20 @@ object Pcm16Processor {
     /**
      * Returns the samples to play for one received packet.
      *
-     * When the remote control channel is active the server has already applied volume,
-     * ceiling and mute for this client IP, so local processing is skipped to avoid
-     * applying the same gain twice. Local processing stays as the fallback for when no
-     * control channel is available.
+     * When the server has acknowledged a mix for this client it owns that mix: it has applied
+     * volume, ceiling and mute for this client IP and keeps applying them for the rest of the
+     * session, including while the control socket is down. Local processing is skipped in that
+     * case so the same gain is never applied twice. Local processing still applies when no mix
+     * was ever acknowledged, because the server is holding its neutral default then, and when
+     * the control channel never came up.
      */
     fun applyLocalProtection(
         samples: ShortArray,
         volumePercent: Int,
         maxLevelPercent: Int,
         muted: Boolean,
-        remoteControlActive: Boolean,
-    ): ShortArray = if (remoteControlActive) {
+        serverOwnsMix: Boolean,
+    ): ShortArray = if (serverOwnsMix) {
         samples
     } else {
         apply(samples, volumePercent, maxLevelPercent, muted)

@@ -71,6 +71,15 @@ Gap found during the run, now closed:
 - The client originally gave no positive confirmation that the control channel was connected.
   The `Control:` line only rendered after `showControlError`, so a healthy session looked
   identical to one whose WebSocket never connected, and server-side evidence was needed to
-  confirm the connection. The client now reports the control channel state directly:
-  `Control: connected - mix applied on the server` while the channel is up, and
-  `Control: unavailable - mixing on this device` when it is not.
+  confirm the connection.
+
+Mix ownership:
+
+- The server keeps the last mix it accepted for a client IP and keeps applying it while the
+  control socket is down, so the client decides who owns the mix from the server's
+  acknowledgement rather than from the socket state. Once a mix has been acknowledged, the
+  client stops applying local processing for the rest of the session. It only applies local
+  processing when no mix was ever acknowledged, because the server is still holding its neutral
+  default then. The control status line reports the resulting ownership:
+  `connected - mix applied on the server`, `channel lost - mix held at the server's last
+  setting`, or `unavailable - mixing on this device`.
