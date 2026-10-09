@@ -83,7 +83,7 @@ the client sent.
 - [x] S1: Server per-channel mute and solo flags plus the audible-channel rule, with pure tests.
 - [x] S2: Protocol `mutes` and `solos` arrays with a boolean merge helper and acknowledgement echo, with parsing tests and a live WebSocket probe.
 - [x] S3: Android mute and solo toggles per source channel, sent with every mix update.
-- [ ] S4: Validate mute and solo on the device with real audio.
+- [x] S4: Validate mute and solo on the device with real audio.
 
 Correction to an earlier draft of this document: S3 originally said the toggles would be "applied
 in the local fallback", which contradicts the architecture note in
@@ -128,8 +128,22 @@ semantics rather than any rule of ours. Structural verification by build was use
 
 ### S4
 
-Not done. Mute and solo have not been exercised on a device with real audio; the audible rule is
-covered by unit tests and the protocol by the probe above, but nobody has heard a solo.
+Verified on the device with real audio, on SM-S916B with a guitar on `INPUT 2`:
+
+- `Solo 2` left only the guitar audible and silenced the other channel.
+- Clearing `Solo 2` restored both channels to exactly their previous levels, with no readjustment
+  needed.
+
+The second observation is the one that matters. It is what distinguishes applying solo at mix time
+on top of the stored gains from the cheaper alternative of zeroing the gains, which would have made
+the musician rebuild the mix after every solo. The operator was asked specifically to report any
+level that did not come back correctly, and reported none.
+
+Run environment: the release binary at `target/release/personal-monitoring.exe`, APK from
+`gradle assembleDebug`, server on `192.168.1.34` with `192.168.1.10:50000` as the client target
+plus a loopback target used to confirm capture was flowing before involving the phone (400 packets
+in four seconds). Worth keeping: confirming capture on the loopback target first avoids chasing an
+audio problem that is actually a dead input device.
 
 ## Acceptance Criteria
 
