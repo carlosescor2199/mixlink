@@ -85,3 +85,10 @@ Invalid messages receive a JSON error response and do not change the current mix
 - The CPAL callback keeps the existing source-rate conversion and integer decimation path; the atomic mix state is read only after samples are reduced to 48 kHz and immediately before bounded UDP enqueueing.
 - A failed control bind/runtime is logged by its own thread and does not terminate audio capture.
 - The control channel listens on `0.0.0.0:50001` by default and has no authentication or encryption; it is intended only for a trusted LAN.
+
+## Protocol Extension
+
+M2 added an optional `channels` array to the `mix` message and to the `mix_ack` acknowledgement,
+carrying one gain per source channel. It is backward compatible: a client that omits the field
+leaves the existing per-channel gains untouched. See `odd/tasks/m2-per-channel-mix-model.md` for
+the current protocol shape.

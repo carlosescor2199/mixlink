@@ -27,6 +27,7 @@ const PACKET_VERSION: u8 = 1;
 const CHANNEL_CAPACITY: usize = 8;
 const HEADER_SIZE: usize = 4 + 1 + 1 + 4 + 8 + 2;
 const MAX_SAMPLES_PER_PACKET: usize = u16::MAX as usize;
+const MAX_MIX_CHANNELS: usize = 32;
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 
 struct Arguments {
@@ -48,6 +49,7 @@ struct PacketStats {
 }
 
 struct MixState {
+    channel_gains: [AtomicU8; MAX_MIX_CHANNELS],
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
@@ -55,6 +57,7 @@ struct MixState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MixValues {
+    channel_gains: [u8; MAX_MIX_CHANNELS],
     volume_percent: u8,
     max_level_percent: u8,
     muted: bool,
@@ -67,6 +70,8 @@ struct MixCommand {
     volume_percent: i32,
     max_level_percent: i32,
     muted: bool,
+    #[serde(default)]
+    channels: Option<Vec<i32>>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +81,7 @@ struct MixAck {
     volume_percent: u8,
     max_level_percent: u8,
     muted: bool,
+    channels: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -486,6 +492,7 @@ fn enqueue_packet(
 impl Default for MixState {
     fn default() -> Self {
         Self {
+            channel_gains: std::array::from_fn(|_| AtomicU8::new(100)),
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
@@ -493,8 +500,26 @@ impl Default for MixState {
     }
 }
 
+impl Default for MixValues {
+    fn default() -> Self {
+        Self {
+            channel_gains: [100; MAX_MIX_CHANNELS],
+            volume_percent: 100,
+            max_level_percent: 100,
+            muted: false,
+        }
+    }
+}
+
 impl MixState {
     fn update(&self, values: MixValues) {
+        for (slot, gain) in self
+            .channel_gains
+            .iter()
+            .zip(values.channel_gains.iter().copied())
+        {
+            slot.store(gain, Ordering::Relaxed);
+        }
         self.volume_percent
             .store(values.volume_percent, Ordering::Relaxed);
         self.max_level_percent
@@ -504,6 +529,9 @@ impl MixState {
 
     fn snapshot(&self) -> MixValues {
         MixValues {
+            channel_gains: std::array::from_fn(|index| {
+                self.channel_gains[index].load(Ordering::Relaxed)
+            }),
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
@@ -511,7 +539,7 @@ impl MixState {
     }
 }
 
-fn parse_mix_command(json: &str) -> Result<MixValues, String> {
+fn parse_mix_command(json: &str, current: MixValues) -> Result<MixValues, String> {
     let command: MixCommand = serde_json::from_str(json).map_err(|error| error.to_string())?;
     if command.message_type != "mix" {
         return Err(format!(
@@ -520,21 +548,51 @@ fn parse_mix_command(json: &str) -> Result<MixValues, String> {
         ));
     }
 
+    let channel_gains = match command.channels.as_ref() {
+        None => current.channel_gains,
+        Some(channels) => {
+            if channels.len() > MAX_MIX_CHANNELS {
+                return Err(format!(
+                    "channels accepts at most {MAX_MIX_CHANNELS} gains, received {}",
+                    channels.len()
+                ));
+            }
+            let mut gains = current.channel_gains;
+            for (slot, value) in gains.iter_mut().zip(channels.iter()) {
+                *slot = (*value).clamp(0, 100) as u8;
+            }
+            gains
+        }
+    };
+
     Ok(MixValues {
+        channel_gains,
         volume_percent: command.volume_percent.clamp(0, 100) as u8,
         max_level_percent: command.max_level_percent.clamp(0, 100) as u8,
         muted: command.muted,
     })
 }
 
-fn apply_mix(samples: &mut [i16], values: MixValues) {
+/// Applies one client's mix to an interleaved PCM buffer.
+///
+/// Source channel `k` maps to output slot `k`, so a buffer whose gains are all 100% is passed
+/// through unchanged, apart from the full-scale ceiling clamp that also applied before this
+/// change (`i16::MIN` becomes `-32767`). Master volume, mute and the ceiling are applied on top
+/// of the per-channel gains.
+fn apply_mix(samples: &mut [i16], channels: usize, values: MixValues) {
+    if channels == 0 {
+        return;
+    }
+
     let ceiling = (i32::from(i16::MAX) * i32::from(values.max_level_percent) / 100) as f32;
-    let gain = f32::from(values.volume_percent) / 100.0;
-    for sample in samples {
+    let master = f32::from(values.volume_percent) / 100.0;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let channel = (index % channels).min(MAX_MIX_CHANNELS - 1);
+        let channel_gain = f32::from(values.channel_gains[channel]) / 100.0;
         let scaled = if values.muted {
             0.0
         } else {
-            f32::from(*sample) * gain
+            f32::from(*sample) * channel_gain * master
         };
         *sample = scaled
             .clamp(-ceiling, ceiling)
@@ -549,6 +607,7 @@ fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
         volume_percent: values.volume_percent,
         max_level_percent: values.max_level_percent,
         muted: values.muted,
+        channels: values.channel_gains.to_vec(),
     })
 }
 
@@ -640,7 +699,7 @@ async fn handle_control_connection(
             Message::Text(text) => {
                 let response = match mix_states.get(&peer.ip()) {
                     None => control_error("no UDP target configured for client IP".to_owned())?,
-                    Some(mix_state) => match parse_mix_command(&text) {
+                    Some(mix_state) => match parse_mix_command(&text, mix_state.snapshot()) {
                         Ok(values) => {
                             mix_state.update(values);
                             mix_ack(mix_state.snapshot())?
@@ -731,7 +790,11 @@ fn spawn_network_thread(
                 let mix_state = mix_states
                     .get(&target.ip())
                     .expect("every target must have a mix state");
-                apply_mix(&mut samples, mix_state.snapshot());
+                apply_mix(
+                    &mut samples,
+                    usize::from(packet.channels),
+                    mix_state.snapshot(),
+                );
                 let target_packet = AudioPacket {
                     channels: packet.channels,
                     sample_rate: packet.sample_rate,
@@ -923,23 +986,19 @@ mod tests {
             .unwrap()
             .update(MixValues {
                 volume_percent: 50,
-                max_level_percent: 100,
-                muted: false,
+                ..MixValues::default()
             });
         states
             .get(&"192.168.1.4".parse().unwrap())
             .unwrap()
-            .update(MixValues {
-                volume_percent: 100,
-                max_level_percent: 100,
-                muted: false,
-            });
+            .update(MixValues::default());
 
         let input = [20_000, -20_000];
         let mut first_output = input;
         let mut second_output = input;
         apply_mix(
             &mut first_output,
+            2,
             states
                 .get(&"192.168.1.3".parse().unwrap())
                 .unwrap()
@@ -947,6 +1006,7 @@ mod tests {
         );
         apply_mix(
             &mut second_output,
+            2,
             states
                 .get(&"192.168.1.4".parse().unwrap())
                 .unwrap()
@@ -973,6 +1033,7 @@ mod tests {
             volume_percent: 0,
             max_level_percent: 10,
             muted: true,
+            ..MixValues::default()
         });
 
         assert_eq!(second_state.snapshot(), initial_second);
@@ -1014,13 +1075,14 @@ mod tests {
     fn clamps_mix_command_and_applies_gain_ceiling() {
         let values = parse_mix_command(
             r#"{"type":"mix","volume_percent":150,"max_level_percent":25,"muted":false}"#,
+            MixValues::default(),
         )
         .unwrap();
         assert_eq!(values.volume_percent, 100);
         assert_eq!(values.max_level_percent, 25);
 
         let mut samples = [i16::MIN, -16_000, 16_000, i16::MAX];
-        apply_mix(&mut samples, values);
+        apply_mix(&mut samples, 2, values);
         assert_eq!(samples, [-8191, -8191, 8191, 8191]);
     }
 
@@ -1028,14 +1090,93 @@ mod tests {
     fn mute_zeroes_samples_and_rejects_other_message_types() {
         let values = parse_mix_command(
             r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":true}"#,
+            MixValues::default(),
         )
         .unwrap();
         let mut samples = [i16::MIN, 0, i16::MAX];
-        apply_mix(&mut samples, values);
+        apply_mix(&mut samples, 2, values);
         assert_eq!(samples, [0, 0, 0]);
         assert!(parse_mix_command(
             r#"{"type":"status","volume_percent":80,"max_level_percent":90,"muted":false}"#,
+            MixValues::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn neutral_channel_gains_leave_the_buffer_unchanged() {
+        let mut samples = [-16_000, -8_000, 8_000, 16_000];
+        let original = samples;
+
+        apply_mix(&mut samples, 2, MixValues::default());
+
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn gain_table_holds_one_entry_per_supported_channel() {
+        assert_eq!(MixValues::default().channel_gains.len(), MAX_MIX_CHANNELS);
+    }
+
+    #[test]
+    fn per_channel_gains_transform_only_their_own_channel() {
+        let values = MixValues {
+            channel_gains: std::array::from_fn(|index| if index == 1 { 50 } else { 100 }),
+            ..MixValues::default()
+        };
+
+        let mut samples = [10_000, 10_000, -10_000, -10_000];
+        apply_mix(&mut samples, 2, values);
+
+        assert_eq!(samples, [10_000, 5_000, -10_000, -5_000]);
+    }
+
+    #[test]
+    fn absent_channels_field_preserves_existing_gains() {
+        let current = MixValues {
+            channel_gains: std::array::from_fn(|index| if index == 0 { 40 } else { 70 }),
+            ..MixValues::default()
+        };
+
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#,
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(values.channel_gains, current.channel_gains);
+        assert_eq!(values.volume_percent, 80);
+    }
+
+    #[test]
+    fn channel_gains_are_clamped_and_oversized_lists_are_rejected() {
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"channels":[150,-20,100]}"#,
+            MixValues::default(),
+        )
+        .unwrap();
+
+        assert_eq!(&values.channel_gains[..3], &[100, 0, 100]);
+        assert_eq!(values.channel_gains[3], 100);
+
+        let oversized = format!(
+            r#"{{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"channels":[{}]}}"#,
+            vec!["100"; MAX_MIX_CHANNELS + 1].join(",")
+        );
+        assert!(parse_mix_command(&oversized, MixValues::default()).is_err());
+    }
+
+    #[test]
+    fn mix_ack_reports_the_applied_channel_gains() {
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"channels":[100,40]}"#,
+            MixValues::default(),
+        )
+        .unwrap();
+
+        let ack = mix_ack(values).unwrap();
+
+        assert!(ack.contains(r#""type":"mix_ack""#));
+        assert!(ack.contains(r#""channels":[100,40,100"#));
     }
 }
