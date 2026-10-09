@@ -100,6 +100,15 @@ internal class ControlChannel(
         sendMixControl()
     }
 
+    /**
+     * Clears ownership so a fresh session starts with the client owning its mix. The client re-sends
+     * its mix on connect and regains ownership on the next acknowledgement; until then the local
+     * master volume stays live even if the control channel never comes up.
+     */
+    fun clearMixOwnership() {
+        mixAcknowledged = false
+    }
+
     fun sendMixControl() {
         controlExecutor.execute {
             val webSocket = controlWebSocket ?: return@execute

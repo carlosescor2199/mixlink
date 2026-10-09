@@ -157,9 +157,10 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         hostInput.isEnabled = false
         portInput.isEnabled = false
         controlPortInput.isEnabled = false
-        statusText.text = "Status: Starting on UDP port $port; control port $controlPort"
         updateStats(0, 0, null)
+        statusText.text = "Status: Starting on UDP port $port; control port $controlPort"
         control.controlState = ControlState.CONNECTING
+        control.clearMixOwnership()
         renderControlStatus()
         control.connect(host, controlPort)
 
@@ -346,6 +347,14 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         if (mixState.sourceChannels > 0 && musicianChannel != null && musicianChannel !in 0 until mixState.sourceChannels) {
             musicianChannel = null
             bankStore.setMusicianChannel(null)
+            if (moreOfMeEnabled) {
+                moreOfMeEnabled = false
+                updatingMoreOfMe = true
+                moreOfMeCheckBox.isChecked = false
+                updatingMoreOfMe = false
+                moreOfMeStatusText.text = "More of me is off: your channel is out of range"
+                control.sendMixControl()
+            }
         }
         updatingMusicianSpinner = true
         buildMusicianChannelAdapter(this, musicianChannelSpinner, mixState.sourceChannels, musicianChannel)
