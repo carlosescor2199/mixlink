@@ -89,7 +89,7 @@ Acknowledgement:
 - [x] P1: Server stereo bus with per-source gain and equal-power pan, defaulting to the current layout, with pure tests.
 - [x] P2: Protocol `pans` array plus the `config` message, with parsing tests and a live WebSocket probe.
 - [x] P3: Android pan controls per channel, the source count taken from `config`, and the local fallback reduced to master controls because the received stream is already the server's stereo output.
-- [ ] P4: Real-audio check on the device with the guitar, then the workspace and Android checks.
+- [x] P4: Real-audio check on the device with the guitar, then the workspace and Android checks.
 
 ## Consequence for the Client
 
@@ -155,6 +155,44 @@ the process is stopped.
 Not verified for this half: nothing was run on a device. Per-source and pan behaviour through
 the app, including that a pan actually moves a source in the stereo field, is covered by P4 and
 has not been done yet.
+
+### P4
+
+- Real-audio check on the device: with the guitar on `INPUT 2`, the operator moved the Channel 2
+  pan from hard right to centre and the guitar moved from the right ear to both ears. That is the
+  behaviour the previous model could not produce, because source channel `k` was bound to output
+  slot `k`.
+- The fader and pan controls appeared from the `config` source count and the labels tracked the
+  drag.
+- `cargo test --workspace` and `gradle test assembleDebug` both passed as listed above.
+
+Two things were observed during this run and are **not resolved**:
+
+- Packet loss appeared where earlier runs had none: 20 sequences lost over 594 packets, about
+  3.4%, against the PRD target of 0.5%, plus 49920 discarded audio samples across 59 packets. The
+  measurement was taken while the orchestrator was also pulling screenshots and running a UDP
+  receiver, so it is **not** a clean baseline, and it could not be re-measured because the device
+  was disconnected first. Treat it as an open question, not a regression, until a quiet run is
+  taken.
+- The captured level was low: the peak absolute sample in a sampled packet was 34 of 32767. The
+  operator may simply not have been playing at that moment, so this is a note rather than a
+  finding, but the input gain on the interface is worth a glance.
+
+### Device gotcha found while running P4
+
+The Volt 4 stopped delivering capture data mid-session while the server still reported
+`PCM capture is running`. Windows had re-enumerated the endpoints (a `LINE 1/2 (Volt 4)` endpoint
+appeared that did not exist earlier) and the CPAL stream stayed attached to an endpoint that no
+longer produced data. A Windows audio error `-2004287484`, the "device invalidated" code, had
+also been logged when a previous server run was force-killed.
+
+What isolated it was a **capture bisection, not a code review**: the same binary against a
+different input device produced 500 valid packets in eight seconds, while the Volt 4 produced
+zero. That exonerated the mixer change and pointed at the device. Replugging the interface USB
+restored capture immediately.
+
+Worth keeping: when the server says capture is running but the client receives nothing, run the
+same binary against another input device before suspecting the code.
 
 ## Acceptance Criteria
 
