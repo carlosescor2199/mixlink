@@ -94,7 +94,7 @@ and a list longer than the supported maximum is rejected. It is echoed in `mix_a
 - [x] G2: Group levels in the mix state and applied in the mixer, with the no-groups case byte-identical to today, tested first.
 - [x] G3: `groups` in the `config` message and `group_levels` in `mix` and `mix_ack`, tested first, with a live WebSocket probe.
 - [x] G4: Client group faders labelled from the config, sent with every mix update.
-- [ ] G5: Workspace and Android checks, then a device session with a real group.
+- [x] G5: Workspace and Android checks, then a device session with a real group.
 
 ## Acceptance Criteria
 
@@ -174,6 +174,35 @@ file that holds the proper solution.
 It is not a correctness problem and the tests cover the behaviour, so it is recorded rather than
 reopened here. Moving `channel_group` out of `MixValues` into a parameter of `mix_channels` is a
 small, self-contained follow-up.
+
+### G5
+
+Verified on the device with the server started as
+`--group "Band=1,2"`:
+
+- The client rendered a new `Groups` section containing one fader labelled `Band`, the name the
+  engineer chose, proving the whole path: argument, validation, `config`, rendering.
+- The operator moved the group fader and confirmed the two member channels move together with their
+  balance preserved, and that the per-channel faders keep working on top of it. That second half is
+  the multiply-rather-than-replace decision, verified rather than assumed.
+
+### Two things the session exposed that are not group bugs
+
+**The client points at a typed IP, so changing networks breaks it silently.** Mid-session the
+machine moved from Wi-Fi to Ethernet, and its address changed from `192.168.1.34` to `192.168.1.27`
+while the Wi-Fi adapter kept holding the old address as a disconnected interface. The audio kept
+flowing, because the server sends UDP to the phone and the phone does not care where it comes from,
+while the control channel failed with `failed to connect to /192.168.1.34 (port 50001)`. Nothing in
+the app said "the address changed"; it said it could not connect. This is precisely the problem PRD
+RF6 (mDNS discovery, "without asking for the IP by hand") exists to remove, and it raises the cost of
+leaving it unimplemented.
+
+**A dead control channel leaves the `Channels` section empty with no explanation.** The client cannot
+know the source channel count without the `config` message, because the audio packet carries the
+finished stereo mix, so with no control channel there is genuinely nothing to render. That is
+architectural, and it is documented in `m2-stereo-bus-pan.md`. What is not defensible is showing a
+bare `Channels` heading over an empty area. The section should say that per-channel controls need the
+control channel, the same way `More of me` says why it is off. Small, self-contained follow-up.
 
 ## Known Limitation
 
