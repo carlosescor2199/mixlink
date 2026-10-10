@@ -9,6 +9,7 @@ use cpal::{
     SupportedStreamConfigRange,
 };
 
+use crate::engine::LevelMeter;
 use crate::network::PacketStats;
 use crate::protocol::AudioPacket;
 
@@ -119,6 +120,7 @@ pub(crate) fn build_input_stream(
     packet_sender: SyncSender<AudioPacket>,
     samples_seen: Arc<AtomicU64>,
     packet_stats: Arc<PacketStats>,
+    levels: Arc<LevelMeter>,
 ) -> Result<Stream, Box<dyn Error>> {
     let config = supported_config.config();
     let channels = config.channels as u8;
@@ -141,6 +143,7 @@ pub(crate) fn build_input_stream(
                             .process(&data.iter().copied().map(f32_to_i16).collect::<Vec<_>>()),
                         channels,
                         &samples_seen,
+                        &levels,
                     );
                 }
             },
@@ -159,6 +162,7 @@ pub(crate) fn build_input_stream(
                         decimator.process(data),
                         channels,
                         &samples_seen,
+                        &levels,
                     );
                 }
             },
@@ -178,6 +182,7 @@ pub(crate) fn build_input_stream(
                             .process(&data.iter().copied().map(u16_to_i16).collect::<Vec<_>>()),
                         channels,
                         &samples_seen,
+                        &levels,
                     );
                 }
             },
@@ -201,8 +206,12 @@ fn enqueue_packet(
     samples: Vec<i16>,
     channels: u8,
     samples_seen: &AtomicU64,
+    levels: &LevelMeter,
 ) {
     samples_seen.fetch_add(samples.len() as u64, Ordering::Relaxed);
+    // Measure the source channels before mixing, so the meter describes the input. The scan is a
+    // single allocation-free pass over the decimated buffer; see [LevelMeter::observe].
+    levels.observe(&samples, usize::from(channels));
     if samples.len() > MAX_SAMPLES_PER_PACKET {
         packet_stats.discarded.fetch_add(1, Ordering::Relaxed);
         return;

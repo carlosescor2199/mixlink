@@ -12,8 +12,10 @@
       {
         "label": "main",
         "title": "MixLink Server",
-        "width": 720,
-        "height": 420,
+        "width": 1180,
+        "height": 780,
+        "minWidth": 820,
+        "minHeight": 600,
         "resizable": true,
         "fullscreen": false
       }

@@ -7,21 +7,89 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main>
-      <h1>MixLink server</h1>
-      <p id="status" class="status">Starting engine…</p>
-
-      <dl class="facts">
-        <dt>Device</dt>
-        <dd id="device">—</dd>
-        <dt>Capture format</dt>
-        <dd id="format">—</dd>
-      </dl>
-
-      <div class="actions">
-        <button id="refresh" type="button">Refresh status</button>
-        <button id="stop" type="button">Stop engine</button>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">MixLink</span>
+        <span class="brand-sub">server</span>
       </div>
+      <div class="topbar-actions">
+        <span id="engine-state" class="state state--idle">starting</span>
+        <button id="refresh" type="button" class="button">Refresh</button>
+        <button id="stop" type="button" class="button button--danger">Stop</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel panel--input">
+        <h2 class="panel-title">Input</h2>
+        <div class="readouts">
+          <div class="readout">
+            <span class="readout-label">Device</span>
+            <span id="device" class="readout-value">—</span>
+          </div>
+          <div class="readout">
+            <span class="readout-label">Capture format</span>
+            <span id="format" class="readout-value">—</span>
+          </div>
+          <div class="readout">
+            <span class="readout-label">Sample rate</span>
+            <span id="sample-rate" class="readout-value mono">—</span>
+          </div>
+          <div class="readout">
+            <span class="readout-label">Control port</span>
+            <span id="control-port" class="readout-value mono">—</span>
+          </div>
+          <div class="readout">
+            <span class="readout-label">Samples received</span>
+            <span id="samples-received" class="readout-value mono">—</span>
+          </div>
+          <div class="readout">
+            <span class="readout-label">Packets sent / discarded</span>
+            <span id="packets" class="readout-value mono">—</span>
+          </div>
+        </div>
+        <p class="hint">Read-only in this build. Device selection and reconfiguration are a later increment.</p>
+      </section>
+
+      <section class="panel panel--channels">
+        <h2 class="panel-title">
+          Sources
+          <span id="channel-count" class="panel-note">0 channels</span>
+        </h2>
+        <p class="hint">Labelled by number and group; per-channel names are not configured in this build.</p>
+        <div id="channels" class="strips"></div>
+      </section>
+
+      <section class="panel panel--musicians">
+        <h2 class="panel-title">
+          Musicians
+          <span id="musician-count" class="panel-note">0 configured</span>
+        </h2>
+        <div class="table-wrap">
+          <table class="musicians">
+            <colgroup>
+              <col class="col-address" />
+              <col class="col-control" />
+              <col class="col-mix" />
+              <col class="col-count" />
+              <col class="col-count" />
+              <col class="col-loss" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Address</th>
+                <th>Control</th>
+                <th>Mix</th>
+                <th class="num">Sent</th>
+                <th class="num">Discarded</th>
+                <th class="num">Loss</th>
+              </tr>
+            </thead>
+            <tbody id="musicians"></tbody>
+          </table>
+        </div>
+        <p id="musicians-empty" class="empty">No musicians configured.</p>
+      </section>
     </main>
 
     <script src="main.js"></script>

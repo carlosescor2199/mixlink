@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -13,7 +13,7 @@ use crate::capture::{build_input_stream, select_device, select_input_config, TAR
 use crate::cli::{resolve_targets, validate_groups, EngineConfig};
 use crate::control::{spawn_control_thread, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
-use crate::mix::{MixState, MixValues};
+use crate::mix::{GroupLayout, MixState, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats, TargetCounters};
 use crate::protocol::AudioPacket;
 
@@ -64,6 +64,18 @@ pub struct MusicianStatus {
     pub counters: MusicianCounters,
 }
 
+/// One configured group of source channels, as the observation API exposes it.
+///
+/// Channels are 0-based source indices, the same numbering the protocol's `config` message and the
+/// mixer use, and membership is fixed at startup. The engine publishes the layout once rather than
+/// a per-channel lookup so there is a single authoritative source of membership; a consumer derives
+/// "which group is channel N in" by reading this list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupStatus {
+    pub name: String,
+    pub channels: Vec<usize>,
+}
+
 /// A snapshot of everything the engine can report without blocking the audio path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineStatus {
@@ -74,6 +86,14 @@ pub struct EngineStatus {
     pub sample_rate: u32,
     /// Source channel count after capture, which fixes the valid group channel range.
     pub source_channels: u8,
+    /// The configured group layout, in the order the engineer defined it.
+    pub groups: Vec<GroupStatus>,
+    /// One 0-100 source-channel peak per channel, index-aligned with the source channels.
+    ///
+    /// The value is measured before mixing, so it describes the input rather than any one
+    /// musician's output, and it carries a decay from one read to the next so a poller at a few
+    /// hertz sees a level that rises immediately and falls smoothly.
+    pub channel_levels: Vec<u8>,
     pub stopped: bool,
     pub samples_received: u64,
     pub packets_sent: u64,
@@ -134,12 +154,107 @@ pub(crate) fn join_musicians(
         .collect()
 }
 
+/// The fixed decay applied to a held peak each time the level is read.
+///
+/// A read happens once per UI poll (a few hertz), so an integer multiply by 7/8 per read makes the
+/// meter fall smoothly between polls. It is deliberately not a time source: the audio callback
+/// must stay free of clock reads, and a poll-rate-relative falloff is enough for a level that only
+/// has to look alive.
+const LEVEL_DECAY_NUMERATOR: u8 = 7;
+const LEVEL_DECAY_DENOMINATOR: u8 = 8;
+
+/// Converts a full-scale-relative sample magnitude into a 0-100 peak.
+///
+/// Linear in amplitude, not decibels: it costs one integer multiply without a logarithm on the
+/// audio thread, and the task only needs a cheap "is there signal here" reading. `i16::MAX`
+/// (`32767`) maps to 100 and silence maps to 0.
+fn peak_to_level(peak: u16) -> u8 {
+    ((u32::from(peak) * 100) / 32767).min(100) as u8
+}
+
+/// Per-source-channel peak levels, measured on the audio thread and held for the UI to poll.
+///
+/// The audio callback raises each channel's held peak with [observe], which is allocation-free and
+/// does one max-scan over the already-decimated samples. Reading with [decayed] applies the decay,
+/// so the cost of decaying sits on the polling path, never on the audio thread.
+pub(crate) struct LevelMeter {
+    levels: [AtomicU8; MAX_MIX_CHANNELS],
+}
+
+impl LevelMeter {
+    pub(crate) fn new() -> Self {
+        Self {
+            levels: std::array::from_fn(|_| AtomicU8::new(0)),
+        }
+    }
+
+    /// Raises each channel's held peak to this block's peak. Called from the audio callback.
+    ///
+    /// Memory order is `Relaxed` on both sides: a meter reading that lags one callback is
+    /// irrelevant, and the value carries no other state, so no synchronisation is warranted. The
+    /// scan is one pass over `samples` with no allocation and no clock or logarithm.
+    pub(crate) fn observe(&self, samples: &[i16], channels: usize) {
+        if channels == 0 || channels > MAX_MIX_CHANNELS || samples.len() % channels != 0 {
+            return;
+        }
+        let frames = samples.len() / channels;
+        for (channel, level) in self.levels.iter().enumerate().take(channels) {
+            let mut peak = 0u16;
+            for frame in 0..frames {
+                let magnitude = samples[frame * channels + channel].unsigned_abs();
+                if magnitude > peak {
+                    peak = magnitude;
+                }
+            }
+            level.fetch_max(peak_to_level(peak), Ordering::Relaxed);
+        }
+    }
+
+    /// Reads the held peaks and decays them for the next read.
+    ///
+    /// Returns one level per source channel, in channel order. `fetch_update` retries against a
+    /// concurrent [observe] instead of clobbering a peak the audio thread raised in between, so a
+    /// busy poll never eats a transient. Channels beyond the metered maximum read as zero, matching
+    /// the mixer, which also ignores them.
+    pub(crate) fn decayed(&self, channels: usize) -> Vec<u8> {
+        (0..channels)
+            .map(|channel| match self.levels.get(channel) {
+                Some(level) => level
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        // Widened so a full-scale 100 times the numerator cannot overflow a u8.
+                        Some(
+                            (u16::from(value) * u16::from(LEVEL_DECAY_NUMERATOR)
+                                / u16::from(LEVEL_DECAY_DENOMINATOR))
+                                as u8,
+                        )
+                    })
+                    .unwrap_or(0),
+                None => 0,
+            })
+            .collect()
+    }
+}
+
+/// Snapshots the fixed group layout into the observation-friendly [GroupStatus] list.
+fn group_statuses(layout: &GroupLayout) -> Vec<GroupStatus> {
+    layout
+        .groups()
+        .iter()
+        .map(|group| GroupStatus {
+            name: group.name.clone(),
+            channels: group.channels.clone(),
+        })
+        .collect()
+}
+
 /// The live engine. Dropping it does not stop the engine; call [EngineHandle::stop].
 pub struct EngineHandle {
     device_name: String,
     capture_format: CaptureFormat,
     control_port: u16,
     source_channels: u8,
+    groups: Vec<GroupStatus>,
+    levels: Arc<LevelMeter>,
     targets: Vec<SocketAddr>,
     stopped: Arc<AtomicBool>,
     samples_seen: Arc<AtomicU64>,
@@ -215,6 +330,8 @@ impl EngineHandle {
             control_port: self.control_port,
             sample_rate: TARGET_SAMPLE_RATE,
             source_channels: self.source_channels,
+            groups: self.groups.clone(),
+            channel_levels: self.levels.decayed(usize::from(self.source_channels)),
             stopped: self.is_stopped(),
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
@@ -344,12 +461,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         Arc::clone(&target_counters),
     )?;
     let samples_seen = Arc::new(AtomicU64::new(0));
+    let levels = Arc::new(LevelMeter::new());
     let stream = build_input_stream(
         &device,
         &supported_config,
         packet_sender.clone(),
         Arc::clone(&samples_seen),
         Arc::clone(&packet_stats),
+        Arc::clone(&levels),
     )?;
     stream
         .play()
@@ -367,6 +486,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         capture_format,
         control_port: config.control_port,
         source_channels,
+        groups: group_statuses(&group_layout),
+        levels,
         targets,
         stopped,
         samples_seen,
@@ -459,5 +580,64 @@ mod tests {
         assert!(connected_without_data.control_connected);
         assert_eq!(connected_without_data.counters, MusicianCounters::default());
         assert_eq!(connected_without_data.mix, MixValues::default());
+    }
+
+    #[test]
+    fn peak_to_level_maps_silence_and_full_scale() {
+        assert_eq!(peak_to_level(0), 0);
+        assert_eq!(peak_to_level(16_384), 50);
+        assert_eq!(peak_to_level(32_767), 100);
+        assert_eq!(peak_to_level(i16::MIN.unsigned_abs()), 100);
+    }
+
+    #[test]
+    fn observe_records_a_peak_per_source_channel() {
+        let meter = LevelMeter::new();
+
+        // Two frames, two channels: channel 0 peaks at half scale, channel 1 at full scale.
+        meter.observe(&[16_384, 32_767, -16_384, -1], 2);
+
+        assert_eq!(meter.decayed(2), vec![50, 100]);
+    }
+
+    #[test]
+    fn a_held_peak_decays_between_reads_and_a_new_block_re_raises_it() {
+        let meter = LevelMeter::new();
+
+        meter.observe(&[32_767, 32_767], 2);
+        assert_eq!(meter.decayed(2), vec![100, 100]);
+        // No new audio: the held peak falls on the next read.
+        assert_eq!(meter.decayed(2), vec![87, 87]);
+        // A fresh block raises it straight back to the block peak.
+        meter.observe(&[32_767, 32_767], 2);
+        assert_eq!(meter.decayed(2), vec![100, 100]);
+    }
+
+    #[test]
+    fn observe_ignores_incomplete_frames_and_zero_channels() {
+        let meter = LevelMeter::new();
+
+        meter.observe(&[1, 2, 3], 2);
+        meter.observe(&[], 0);
+
+        assert_eq!(meter.decayed(2), vec![0, 0]);
+    }
+
+    #[test]
+    fn group_statuses_carry_names_and_zero_based_channels() {
+        use crate::mix::Group;
+
+        let layout = GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![0, 1],
+        }]);
+
+        assert_eq!(
+            group_statuses(&layout),
+            vec![GroupStatus {
+                name: "Drums".to_owned(),
+                channels: vec![0, 1],
+            }]
+        );
     }
 }

@@ -16,7 +16,8 @@ use crate::mix::{GroupLayout, MixState};
 
 pub use cli::{parse_arguments, EngineConfig, GroupDefinition};
 pub use engine::{
-    start, CaptureFormat, EngineEvent, EngineHandle, EngineStatus, MusicianCounters, MusicianStatus,
+    start, CaptureFormat, EngineEvent, EngineHandle, EngineStatus, GroupStatus, MusicianCounters,
+    MusicianStatus,
 };
 pub use mix::MixValues;
 

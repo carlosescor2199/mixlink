@@ -84,6 +84,28 @@ pub struct MusicianDto {
     pub packets_discarded: u64,
 }
 
+/// One configured group, with the same 0-based source indices the engine uses.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupDto {
+    pub name: String,
+    pub channels: Vec<usize>,
+}
+
+/// One source channel as the window shows it: a 1-based number, its group when the engineer
+/// configured one, and the live pre-mix peak.
+///
+/// There are no per-channel names in the system yet, so a channel is labelled by number and group
+/// rather than by a name like "Kick". Naming is engineer configuration that does not exist, and
+/// inventing names here would misrepresent the system.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDto {
+    pub number: u8,
+    pub group: Option<String>,
+    pub level: u8,
+}
+
 impl From<&MusicianStatus> for MusicianDto {
     fn from(musician: &MusicianStatus) -> Self {
         Self {
@@ -107,6 +129,8 @@ pub struct EngineStatusDto {
     pub control_port: u16,
     pub sample_rate: u32,
     pub source_channels: u8,
+    pub groups: Vec<GroupDto>,
+    pub channels: Vec<ChannelDto>,
     pub stopped: bool,
     pub samples_received: u64,
     pub packets_sent: u64,
@@ -116,17 +140,101 @@ pub struct EngineStatusDto {
 
 impl From<&EngineStatus> for EngineStatusDto {
     fn from(status: &EngineStatus) -> Self {
+        let groups: Vec<GroupDto> = status
+            .groups
+            .iter()
+            .map(|group| GroupDto {
+                name: group.name.clone(),
+                channels: group.channels.clone(),
+            })
+            .collect();
+        // The engine publishes the group layout once; the per-channel membership the window needs
+        // is derived here rather than being stored twice and risking the two views disagreeing.
+        let channels = (0..usize::from(status.source_channels))
+            .map(|index| ChannelDto {
+                number: (index + 1) as u8,
+                group: status
+                    .groups
+                    .iter()
+                    .find(|group| group.channels.contains(&index))
+                    .map(|group| group.name.clone()),
+                level: status.channel_levels.get(index).copied().unwrap_or(0),
+            })
+            .collect();
         Self {
             device_name: status.device_name.clone(),
             capture_format: (&status.capture_format).into(),
             control_port: status.control_port,
             sample_rate: status.sample_rate,
             source_channels: status.source_channels,
+            groups,
+            channels,
             stopped: status.stopped,
             samples_received: status.samples_received,
             packets_sent: status.packets_sent,
             packets_discarded: status.packets_discarded,
             musicians: status.musicians.iter().map(MusicianDto::from).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use personal_monitoring::{CaptureFormat, EngineStatus, GroupStatus};
+
+    fn status_with(groups: Vec<GroupStatus>, channel_levels: Vec<u8>) -> EngineStatus {
+        EngineStatus {
+            device_name: "Test device".to_owned(),
+            capture_format: CaptureFormat {
+                channels: 2,
+                sample_rate: 48_000,
+                sample_format: "I16".to_owned(),
+                buffer_size: "Default".to_owned(),
+            },
+            control_port: 50001,
+            sample_rate: 48_000,
+            source_channels: 2,
+            groups,
+            channel_levels,
+            stopped: false,
+            samples_received: 0,
+            packets_sent: 0,
+            packets_discarded: 0,
+            musicians: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn channels_label_by_number_with_their_group_and_level() {
+        let status = status_with(
+            vec![GroupStatus {
+                name: "Drums".to_owned(),
+                channels: vec![0],
+            }],
+            vec![50, 100],
+        );
+
+        let dto = EngineStatusDto::from(&status);
+
+        assert_eq!(dto.channels.len(), 2);
+        assert_eq!(dto.channels[0].number, 1);
+        assert_eq!(dto.channels[0].group.as_deref(), Some("Drums"));
+        assert_eq!(dto.channels[0].level, 50);
+        assert_eq!(dto.channels[1].number, 2);
+        assert_eq!(dto.channels[1].group, None);
+        assert_eq!(dto.channels[1].level, 100);
+        assert_eq!(dto.groups.len(), 1);
+        assert_eq!(dto.groups[0].channels, vec![0]);
+    }
+
+    #[test]
+    fn a_channel_without_a_group_reports_no_group() {
+        let status = status_with(Vec::new(), vec![0, 0]);
+
+        let dto = EngineStatusDto::from(&status);
+
+        assert!(dto.channels.iter().all(|channel| channel.group.is_none()));
+        assert!(dto.groups.is_empty());
     }
 }

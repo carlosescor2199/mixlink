@@ -4,6 +4,8 @@
 //! these commands: it prints the JSON the frontend receives.
 
 use std::sync::Mutex;
+use std::thread::sleep;
+use std::time::Duration;
 
 use mixlink_desktop::commands;
 use mixlink_desktop::dto::StartRequest;
@@ -28,6 +30,23 @@ fn main() {
         "engine_status json -> {}",
         serde_json::to_string(&status).expect("status should serialize")
     );
+
+    // Poll the way the window does, so the live source levels the frontend renders are visible
+    // without a webview: samples_received must climb and the per-channel levels must react.
+    for tick in 1..=4 {
+        sleep(Duration::from_millis(300));
+        let status = commands::engine_status(&state).expect("status should be available");
+        println!(
+            "poll {tick} -> samples_received={} packets_sent={} channel_levels={:?}",
+            status.samples_received,
+            status.packets_sent,
+            status
+                .channels
+                .iter()
+                .map(|channel| channel.level)
+                .collect::<Vec<_>>()
+        );
+    }
 
     commands::stop_engine(&state).expect("the engine should stop");
     println!("stop_engine -> ok");
