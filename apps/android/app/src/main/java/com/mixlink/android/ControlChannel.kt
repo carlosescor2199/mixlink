@@ -26,7 +26,7 @@ internal class ControlChannel(
 ) {
     interface Listener {
         fun onOpened()
-        fun onConfig(channels: Int)
+        fun onConfig(channels: Int, groups: List<GroupInfo>)
         fun onAcknowledged()
         fun onClosed()
         fun onControlError(message: String)
@@ -56,7 +56,7 @@ internal class ControlChannel(
                     "config" -> {
                         val announcedChannels = message.optInt("source_channels", -1)
                         if (announcedChannels in 1..MAX_CHANNELS) {
-                            listener.onConfig(announcedChannels)
+                            listener.onConfig(announcedChannels, parseGroups(message.optJSONArray("groups")))
                         }
                     }
                     "mix_ack" -> {
@@ -149,6 +149,10 @@ internal class ControlChannel(
         for (solo in snapshot.channelSolos) {
             soloFlags.put(solo)
         }
+        val groupLevels = JSONArray()
+        for (level in snapshot.groupLevels) {
+            groupLevels.put(level)
+        }
         return JSONObject()
             .put("type", "mix")
             .put("volume_percent", snapshot.volumePercent)
@@ -158,6 +162,30 @@ internal class ControlChannel(
             .put("pans", panLevels)
             .put("mutes", muteFlags)
             .put("solos", soloFlags)
+            .put("group_levels", groupLevels)
             .toString()
     }
+}
+
+/**
+ * Reads the `groups` array from a `config` message. Missing or malformed entries are skipped, and a
+ * server that announces no groups yields an empty list, which leaves the client's group section
+ * empty rather than inventing one.
+ */
+private fun parseGroups(array: JSONArray?): List<GroupInfo> {
+    if (array == null) return emptyList()
+    val groups = ArrayList<GroupInfo>(array.length())
+    for (index in 0 until array.length()) {
+        val entry = array.optJSONObject(index) ?: continue
+        val name = entry.optString("name")
+        if (name.isEmpty()) continue
+        val channelsJson = entry.optJSONArray("channels")
+        val channels = if (channelsJson == null) {
+            emptyList()
+        } else {
+            (0 until channelsJson.length()).map { channelsJson.optInt(it, -1) }.filter { it >= 0 }
+        }
+        groups.add(GroupInfo(name, channels))
+    }
+    return groups
 }

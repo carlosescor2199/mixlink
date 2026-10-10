@@ -1,5 +1,8 @@
 package com.mixlink.android
 
+/** A named group of source channels announced by the server in `config`. Channels are 0-based. */
+data class GroupInfo(val name: String, val channels: List<Int>)
+
 /**
  * The device-local mix state shared by the receive loop, the control channel and the UI.
  *
@@ -13,6 +16,8 @@ internal class ClientMixState {
     @Volatile var channelPans: IntArray = IntArray(0)
     @Volatile var channelMutes: BooleanArray = BooleanArray(0)
     @Volatile var channelSolos: BooleanArray = BooleanArray(0)
+    @Volatile var groups: List<GroupInfo> = emptyList()
+    @Volatile var groupLevels: IntArray = IntArray(0)
     @Volatile var volumePercent = 100
     @Volatile var maxLevelPercent = 100
     @Volatile var muted = false

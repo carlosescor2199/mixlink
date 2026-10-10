@@ -18,6 +18,7 @@ data class MixSnapshot(
     val channelPans: IntArray = IntArray(0),
     val channelMutes: BooleanArray = BooleanArray(0),
     val channelSolos: BooleanArray = BooleanArray(0),
+    val groupLevels: IntArray = IntArray(0),
     val volumePercent: Int = 100,
     val maxLevelPercent: Int = 100,
     val muted: Boolean = false,
@@ -27,6 +28,7 @@ data class MixSnapshot(
         put("channelPans", JSONArray(channelPans.toList()))
         put("channelMutes", JSONArray(channelMutes.toList()))
         put("channelSolos", JSONArray(channelSolos.toList()))
+        put("groupLevels", JSONArray(groupLevels.toList()))
         put("volumePercent", volumePercent)
         put("maxLevelPercent", maxLevelPercent)
         put("muted", muted)
@@ -66,6 +68,7 @@ data class MixSnapshot(
                 channelPans = parsed.intArray("channelPans"),
                 channelMutes = parsed.booleanArray("channelMutes"),
                 channelSolos = parsed.booleanArray("channelSolos"),
+                groupLevels = parsed.intArray("groupLevels"),
                 volumePercent = parsed.optInt("volumePercent", 100),
                 maxLevelPercent = parsed.optInt("maxLevelPercent", 100),
                 muted = parsed.optBoolean("muted", false),

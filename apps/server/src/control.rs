@@ -11,14 +11,15 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
-use crate::mix::MixState;
-use crate::protocol::{control_error, mix_ack, parse_mix_command, ControlConfig};
+use crate::mix::{GroupLayout, MixState};
+use crate::protocol::{control_error, mix_ack, parse_mix_command, ControlConfig, GroupConfig};
 
 pub(crate) fn spawn_control_thread(
     control_port: u16,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     stopped: Arc<AtomicBool>,
     source_channels: u8,
+    groups: Arc<GroupLayout>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let listener = match std::net::TcpListener::bind(("0.0.0.0", control_port)) {
@@ -47,6 +48,7 @@ pub(crate) fn spawn_control_thread(
             mix_states,
             stopped,
             source_channels,
+            groups,
         ));
     })
 }
@@ -56,6 +58,7 @@ async fn run_control_server(
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     stopped: Arc<AtomicBool>,
     source_channels: u8,
+    groups: Arc<GroupLayout>,
 ) {
     let listener = match TcpListener::from_std(listener) {
         Ok(listener) => listener,
@@ -77,9 +80,11 @@ async fn run_control_server(
             Some(accepted) => match accepted {
                 Ok((stream, peer)) => {
                     let states = Arc::clone(&mix_states);
+                    let groups = Arc::clone(&groups);
                     tokio::spawn(async move {
                         if let Err(error) =
-                            handle_control_connection(stream, peer, states, source_channels).await
+                            handle_control_connection(stream, peer, states, source_channels, groups)
+                                .await
                         {
                             eprintln!("control connection {peer} error: {error}");
                         }
@@ -96,6 +101,7 @@ async fn handle_control_connection(
     peer: SocketAddr,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     source_channels: u8,
+    groups: Arc<GroupLayout>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = accept_async(stream).await?;
     let (mut writer, mut reader) = websocket.split();
@@ -103,6 +109,14 @@ async fn handle_control_connection(
         message_type: "config",
         source_channels,
         sample_rate: TARGET_SAMPLE_RATE,
+        groups: groups
+            .groups()
+            .iter()
+            .map(|group| GroupConfig {
+                name: group.name.clone(),
+                channels: group.channels.clone(),
+            })
+            .collect(),
     })?;
     writer.send(Message::Text(config.into())).await?;
     while let Some(message) = reader.next().await {

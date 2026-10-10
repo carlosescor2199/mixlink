@@ -1,13 +1,59 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub(crate) const MAX_MIX_CHANNELS: usize = 32;
+pub(crate) const MAX_GROUPS: usize = 16;
 pub(crate) const OUTPUT_CHANNELS: u8 = 2;
+
+/// A named group of source channels, with 0-based indices as the protocol and the mixer use them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Group {
+    pub(crate) name: String,
+    pub(crate) channels: Vec<usize>,
+}
+
+/// The groups plus the derived channel-to-group lookup.
+///
+/// Membership is fixed at startup, so the lookup is built once and copied into every [MixValues]
+/// snapshot the network thread reads. A channel belongs to at most one group, which validation
+/// enforces; the lookup is therefore a single owner per channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GroupLayout {
+    groups: Vec<Group>,
+    channel_group: [Option<usize>; MAX_MIX_CHANNELS],
+}
+
+impl GroupLayout {
+    pub(crate) fn new(groups: Vec<Group>) -> Self {
+        let mut channel_group = [None; MAX_MIX_CHANNELS];
+        for (index, group) in groups.iter().enumerate() {
+            for &channel in &group.channels {
+                if channel < MAX_MIX_CHANNELS {
+                    channel_group[channel] = Some(index);
+                }
+            }
+        }
+        Self {
+            groups,
+            channel_group,
+        }
+    }
+
+    pub(crate) fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    pub(crate) fn channel_group(&self) -> [Option<usize>; MAX_MIX_CHANNELS] {
+        self.channel_group
+    }
+}
 
 pub(crate) struct MixState {
     channel_gains: [AtomicU8; MAX_MIX_CHANNELS],
     pans: [AtomicU8; MAX_MIX_CHANNELS],
     channel_muted: [AtomicBool; MAX_MIX_CHANNELS],
     channel_solo: [AtomicBool; MAX_MIX_CHANNELS],
+    group_levels: [AtomicU8; MAX_GROUPS],
+    channel_group: [Option<usize>; MAX_MIX_CHANNELS],
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
@@ -19,6 +65,8 @@ pub(crate) struct MixValues {
     pub(crate) pans: [u8; MAX_MIX_CHANNELS],
     pub(crate) channel_muted: [bool; MAX_MIX_CHANNELS],
     pub(crate) channel_solo: [bool; MAX_MIX_CHANNELS],
+    pub(crate) group_levels: [u8; MAX_GROUPS],
+    pub(crate) channel_group: [Option<usize>; MAX_MIX_CHANNELS],
     pub(crate) volume_percent: u8,
     pub(crate) max_level_percent: u8,
     pub(crate) muted: bool,
@@ -41,6 +89,8 @@ impl Default for MixState {
             pans: std::array::from_fn(|index| AtomicU8::new(default_pan(index))),
             channel_muted: std::array::from_fn(|_| AtomicBool::new(false)),
             channel_solo: std::array::from_fn(|_| AtomicBool::new(false)),
+            group_levels: std::array::from_fn(|_| AtomicU8::new(100)),
+            channel_group: [None; MAX_MIX_CHANNELS],
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
@@ -55,6 +105,8 @@ impl Default for MixValues {
             pans: std::array::from_fn(default_pan),
             channel_muted: [false; MAX_MIX_CHANNELS],
             channel_solo: [false; MAX_MIX_CHANNELS],
+            group_levels: [100; MAX_GROUPS],
+            channel_group: [None; MAX_MIX_CHANNELS],
             volume_percent: 100,
             max_level_percent: 100,
             muted: false,
@@ -62,7 +114,7 @@ impl Default for MixValues {
     }
 }
 
-fn store_all(slots: &[AtomicU8; MAX_MIX_CHANNELS], values: &[u8; MAX_MIX_CHANNELS]) {
+fn store_all<const N: usize>(slots: &[AtomicU8; N], values: &[u8; N]) {
     for (slot, value) in slots.iter().zip(values.iter().copied()) {
         slot.store(value, Ordering::Relaxed);
     }
@@ -75,11 +127,21 @@ fn store_all_flags(slots: &[AtomicBool; MAX_MIX_CHANNELS], values: &[bool; MAX_M
 }
 
 impl MixState {
+    /// Builds a state that carries the server's fixed group membership. Each client's group levels
+    /// start neutral, so a client that never sends `group_levels` hears every channel ungrouped.
+    pub(crate) fn new(layout: &GroupLayout) -> Self {
+        Self {
+            channel_group: layout.channel_group(),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn update(&self, values: MixValues) {
         store_all(&self.channel_gains, &values.channel_gains);
         store_all(&self.pans, &values.pans);
         store_all_flags(&self.channel_muted, &values.channel_muted);
         store_all_flags(&self.channel_solo, &values.channel_solo);
+        store_all(&self.group_levels, &values.group_levels);
         self.volume_percent
             .store(values.volume_percent, Ordering::Relaxed);
         self.max_level_percent
@@ -99,6 +161,10 @@ impl MixState {
             channel_solo: std::array::from_fn(|index| {
                 self.channel_solo[index].load(Ordering::Relaxed)
             }),
+            group_levels: std::array::from_fn(|index| {
+                self.group_levels[index].load(Ordering::Relaxed)
+            }),
+            channel_group: self.channel_group,
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
@@ -110,17 +176,17 @@ impl MixState {
 ///
 /// An absent list preserves the current values, so a client that does not send the field keeps
 /// working. Values are clamped; an oversized list is rejected rather than silently truncated.
-pub(crate) fn merge_levels(
+pub(crate) fn merge_levels<const N: usize>(
     label: &str,
     incoming: Option<&Vec<i32>>,
-    current: &[u8; MAX_MIX_CHANNELS],
-) -> Result<[u8; MAX_MIX_CHANNELS], String> {
+    current: &[u8; N],
+) -> Result<[u8; N], String> {
     let Some(values) = incoming else {
         return Ok(*current);
     };
-    if values.len() > MAX_MIX_CHANNELS {
+    if values.len() > N {
         return Err(format!(
-            "{label} accepts at most {MAX_MIX_CHANNELS} values, received {}",
+            "{label} accepts at most {N} values, received {}",
             values.len()
         ));
     }
@@ -205,7 +271,14 @@ pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -
             if any_solo && !values.channel_solo[channel] {
                 continue;
             }
-            let gain = f32::from(values.channel_gains[channel]) / 100.0 * master;
+            // A grouped channel is scaled by its group level; an ungrouped channel uses 1.0, and
+            // `x * 1.0 == x` for every f32, so the no-group case stays byte-identical to the
+            // pre-group arithmetic.
+            let group_gain = match values.channel_group[channel] {
+                Some(group) => f32::from(values.group_levels[group]) / 100.0,
+                None => 1.0,
+            };
+            let gain = f32::from(values.channel_gains[channel]) / 100.0 * group_gain * master;
             if gain == 0.0 || values.muted {
                 continue;
             }
@@ -234,7 +307,7 @@ mod tests {
             "192.168.1.3:50000".parse().unwrap(),
             "192.168.1.4:50000".parse().unwrap(),
         ];
-        let states = build_mix_states(&targets).unwrap();
+        let states = build_mix_states(&targets, &GroupLayout::default()).unwrap();
         states
             .get(&"192.168.1.3".parse().unwrap())
             .unwrap()
@@ -275,7 +348,7 @@ mod tests {
             "192.168.1.3:50000".parse().unwrap(),
             "192.168.1.4:50000".parse().unwrap(),
         ];
-        let states = build_mix_states(&targets).unwrap();
+        let states = build_mix_states(&targets, &GroupLayout::default()).unwrap();
         let first_ip: IpAddr = "192.168.1.3".parse().unwrap();
         let second_ip: IpAddr = "192.168.1.4".parse().unwrap();
         let second_state = states.get(&second_ip).unwrap();
@@ -548,5 +621,107 @@ mod tests {
             vec!["false"; MAX_MIX_CHANNELS + 1].join(",")
         );
         assert!(parse_mix_command(&oversized, MixValues::default()).is_err());
+    }
+
+    #[test]
+    fn a_group_level_scales_every_member_and_keeps_their_balance() {
+        let layout = GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![0, 1],
+        }]);
+        let mut group_levels = [100u8; MAX_GROUPS];
+        group_levels[0] = 50;
+        let values = MixValues {
+            channel_group: layout.channel_group(),
+            group_levels,
+            ..MixValues::default()
+        };
+
+        let samples = mix_channels(&[20_000, 20_000], 2, values);
+
+        // Both members are halved, and because their pans are opposite the sum lands in each
+        // output at the same reduced level: the relative balance survives.
+        assert_eq!(samples, [10_000, 10_000]);
+    }
+
+    #[test]
+    fn a_channel_in_no_group_ignores_every_group_level() {
+        let layout = GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![0],
+        }]);
+        let mut group_levels = [100u8; MAX_GROUPS];
+        group_levels[0] = 0;
+        let values = MixValues {
+            channel_group: layout.channel_group(),
+            group_levels,
+            ..MixValues::default()
+        };
+
+        let samples = mix_channels(&[10_000, 10_000], 2, values);
+
+        assert_eq!(samples, [0, 10_000]);
+    }
+
+    #[test]
+    fn no_groups_reproduces_the_current_mix_byte_for_byte() {
+        let source = [-16_000, -8_000, 8_000, 16_000];
+        let layout = GroupLayout::default();
+        let without_groups = MixValues {
+            channel_group: layout.channel_group(),
+            ..MixValues::default()
+        };
+
+        assert_eq!(mix_channels(&source, 2, without_groups), source);
+        assert_eq!(
+            mix_channels(&source, 2, without_groups),
+            mix_channels(&source, 2, MixValues::default())
+        );
+    }
+
+    #[test]
+    fn absent_group_levels_preserve_and_oversized_lists_are_rejected() {
+        let mut current = MixValues::default();
+        current.group_levels[0] = 40;
+
+        let preserved = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#,
+            current,
+        )
+        .unwrap();
+        assert_eq!(preserved.group_levels, current.group_levels);
+
+        let clamped = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"group_levels":[150,-5,50]}"#,
+            current,
+        )
+        .unwrap();
+        assert_eq!(&clamped.group_levels[..3], &[100, 0, 50]);
+
+        let oversized = format!(
+            r#"{{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"group_levels":[{}]}}"#,
+            vec!["50"; MAX_GROUPS + 1].join(",")
+        );
+        assert!(parse_mix_command(&oversized, current).is_err());
+    }
+
+    #[test]
+    fn a_mix_update_preserves_the_servers_group_membership() {
+        let layout = GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![0],
+        }]);
+
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"group_levels":[50]}"#,
+            MixValues {
+                channel_group: layout.channel_group(),
+                ..MixValues::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(values.channel_group[0], Some(0));
+        assert_eq!(values.group_levels[0], 50);
     }
 }

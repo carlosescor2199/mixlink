@@ -22,6 +22,8 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
     private lateinit var statusText: TextView
     private lateinit var controlStatusText: TextView
     private lateinit var channelContainer: LinearLayout
+    private lateinit var groupsHeader: TextView
+    private lateinit var groupContainer: LinearLayout
     private lateinit var statsText: TextView
     private lateinit var errorText: TextView
     private lateinit var volumeSeekBar: SeekBar
@@ -68,6 +70,8 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         statusText = findViewById(R.id.statusText)
         controlStatusText = findViewById(R.id.controlStatusText)
         channelContainer = findViewById(R.id.channelContainer)
+        groupsHeader = findViewById(R.id.groupsHeader)
+        groupContainer = findViewById(R.id.groupContainer)
         statsText = findViewById(R.id.statsText)
         errorText = findViewById(R.id.errorText)
         volumeSeekBar = findViewById(R.id.volumeSeekBar)
@@ -227,6 +231,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         channelPans = mixState.channelPans,
         channelMutes = mixState.channelMutes,
         channelSolos = mixState.channelSolos,
+        groupLevels = mixState.groupLevels,
         volumePercent = mixState.volumePercent,
         maxLevelPercent = mixState.maxLevelPercent,
         muted = mixState.muted,
@@ -243,6 +248,22 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
             rebuildChannelControls(this, channelContainer, channels, mixState) { control.sendMixControl() }
             renderMusicianChannel()
         }
+    }
+
+    private fun syncGroupControls(groups: List<GroupInfo>) {
+        mixState.groups = groups
+        mixState.groupLevels = IntArray(groups.size) { index -> mixState.groupLevels.getOrElse(index) { 100 } }
+        runOnUiThread { renderGroupControls() }
+    }
+
+    /**
+     * Shows the group section only when the server announced at least one group, so a server with no
+     * `--group` argument leaves the client exactly as it was before groups existed.
+     */
+    private fun renderGroupControls() {
+        val groups = mixState.groups
+        groupsHeader.visibility = if (groups.isEmpty()) View.GONE else View.VISIBLE
+        rebuildGroupControls(this, groupContainer, groups, mixState) { control.sendMixControl() }
     }
 
     private fun saveCurrentBank() {
@@ -297,6 +318,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         mixState.channelPans = snapshot.channelPans.copyOf()
         mixState.channelMutes = snapshot.channelMutes.copyOf()
         mixState.channelSolos = snapshot.channelSolos.copyOf()
+        mixState.groupLevels = snapshot.groupLevels.copyOf()
         mixState.volumePercent = snapshot.volumePercent
         mixState.maxLevelPercent = snapshot.maxLevelPercent
         mixState.muted = snapshot.muted
@@ -307,6 +329,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
             maxLevelValueText.text = "${mixState.maxLevelPercent}%"
             muteCheckBox.isChecked = mixState.muted
             rebuildChannelControls(this, channelContainer, mixState.channelGains.size, mixState) { control.sendMixControl() }
+            renderGroupControls()
             control.sendMixControl()
         }
     }
@@ -404,8 +427,9 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         renderControlStatus()
     }
 
-    override fun onConfig(channels: Int) {
+    override fun onConfig(channels: Int, groups: List<GroupInfo>) {
         syncChannelControls(channels)
+        syncGroupControls(groups)
     }
 
     override fun onAcknowledged() {

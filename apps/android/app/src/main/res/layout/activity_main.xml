@@ -92,6 +92,20 @@
             android:orientation="vertical" />
 
         <TextView
+            android:id="@+id/groupsHeader"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Groups"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:id="@+id/groupContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
+        <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"

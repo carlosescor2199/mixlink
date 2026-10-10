@@ -15,9 +15,9 @@ use std::time::Duration;
 use cpal::traits::{HostTrait, StreamTrait};
 
 use crate::capture::{build_input_stream, select_device, select_input_config, TARGET_SAMPLE_RATE};
-use crate::cli::{parse_arguments, resolve_targets};
+use crate::cli::{parse_arguments, resolve_targets, validate_groups};
 use crate::control::spawn_control_thread;
-use crate::mix::MixState;
+use crate::mix::{GroupLayout, MixState};
 use crate::network::{spawn_network_thread, PacketStats};
 
 const CHANNEL_CAPACITY: usize = 8;
@@ -66,13 +66,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let stopped = Arc::new(AtomicBool::new(false));
-    let mix_states = build_mix_states(&targets)?;
     let source_channels = supported_config.channels().min(u16::from(u8::MAX)) as u8;
+    let group_layout = Arc::new(validate_groups(
+        &arguments.groups,
+        usize::from(source_channels),
+    )?);
+    let mix_states = build_mix_states(&targets, &group_layout)?;
     let control_thread = spawn_control_thread(
         arguments.control_port,
         Arc::clone(&mix_states),
         Arc::clone(&stopped),
         source_channels,
+        Arc::clone(&group_layout),
     );
     let (packet_sender, packet_receiver) = sync_channel(CHANNEL_CAPACITY);
     let packet_stats = Arc::new(PacketStats {
@@ -125,11 +130,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn build_mix_states(
     targets: &[SocketAddr],
+    group_layout: &GroupLayout,
 ) -> Result<Arc<HashMap<IpAddr, Arc<MixState>>>, Box<dyn Error>> {
     let mut mix_states = HashMap::with_capacity(targets.len());
     for target in targets {
         if mix_states
-            .insert(target.ip(), Arc::new(MixState::default()))
+            .insert(target.ip(), Arc::new(MixState::new(group_layout)))
             .is_some()
         {
             return Err(format!(

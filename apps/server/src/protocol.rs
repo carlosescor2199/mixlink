@@ -28,6 +28,8 @@ pub(crate) struct MixCommand {
     pub(crate) mutes: Option<Vec<bool>>,
     #[serde(default)]
     pub(crate) solos: Option<Vec<bool>>,
+    #[serde(default)]
+    pub(crate) group_levels: Option<Vec<i32>>,
 }
 
 /// Parses a `mix` control message and merges it into the client's current values.
@@ -51,12 +53,21 @@ pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixVal
     let pans = merge_levels("pans", command.pans.as_ref(), &current.pans)?;
     let channel_muted = merge_flags("mutes", command.mutes.as_ref(), &current.channel_muted)?;
     let channel_solo = merge_flags("solos", command.solos.as_ref(), &current.channel_solo)?;
+    let group_levels = merge_levels(
+        "group_levels",
+        command.group_levels.as_ref(),
+        &current.group_levels,
+    )?;
 
     Ok(MixValues {
         channel_gains,
         pans,
         channel_muted,
         channel_solo,
+        group_levels,
+        // Membership is server configuration, never client input: preserve whatever the source
+        // snapshot carried.
+        channel_group: current.channel_group,
         volume_percent: command.volume_percent.clamp(0, 100) as u8,
         max_level_percent: command.max_level_percent.clamp(0, 100) as u8,
         muted: command.muted,
@@ -74,6 +85,14 @@ struct MixAck {
     pans: Vec<u8>,
     mutes: Vec<bool>,
     solos: Vec<bool>,
+    group_levels: Vec<u8>,
+}
+
+/// One group as it appears in the `config` message: a name and 0-based source channel indices.
+#[derive(Serialize)]
+pub(crate) struct GroupConfig {
+    pub(crate) name: String,
+    pub(crate) channels: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -82,6 +101,7 @@ pub(crate) struct ControlConfig {
     pub(crate) message_type: &'static str,
     pub(crate) source_channels: u8,
     pub(crate) sample_rate: u32,
+    pub(crate) groups: Vec<GroupConfig>,
 }
 
 #[derive(Serialize)]
@@ -117,6 +137,7 @@ pub(crate) fn mix_ack(values: MixValues) -> Result<String, serde_json::Error> {
         pans: values.pans.to_vec(),
         mutes: values.channel_muted.to_vec(),
         solos: values.channel_solo.to_vec(),
+        group_levels: values.group_levels.to_vec(),
     })
 }
 
@@ -162,5 +183,35 @@ mod tests {
 
         assert!(ack.contains(r#""type":"mix_ack""#));
         assert!(ack.contains(r#""channels":[100,40,100"#));
+    }
+
+    #[test]
+    fn mix_ack_echoes_the_group_levels() {
+        let values = parse_mix_command(
+            r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false,"channels":[100,40],"group_levels":[80]}"#,
+            MixValues::default(),
+        )
+        .unwrap();
+
+        let ack = mix_ack(values).unwrap();
+
+        assert!(ack.contains(r#""group_levels":[80,"#));
+    }
+
+    #[test]
+    fn config_carries_groups_with_zero_based_channels() {
+        let config = ControlConfig {
+            message_type: "config",
+            source_channels: 2,
+            sample_rate: 48_000,
+            groups: vec![GroupConfig {
+                name: "Drums".to_owned(),
+                channels: vec![0, 1],
+            }],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(json.contains(r#""groups":[{"name":"Drums","channels":[0,1]}]"#));
     }
 }
