@@ -79,7 +79,7 @@ two studios would be a bug.
 - [x] D1: Beacon format and its round trip, plus the broadcast thread, tested first.
 - [x] D2: Client listener and the "found servers" list, with the two-facts parsing tested first.
 - [x] D3: One tap fills the address and control port; manual entry still works and is not overwritten.
-- [ ] D4: Checks, then a device session where the server's address changes and the client recovers.
+- [x] D4: Checks, then a device session where the server's address changes and the client recovers.
 
 ## Acceptance Criteria
 
@@ -142,6 +142,37 @@ Discovery listens while idle, pauses during a session, and resumes on stop. A bi
 discovery port stops discovery silently: with no beacon the screen looks exactly as it did before,
 which is the stated acceptance, and surfacing it would add noise for a case the spec does not ask
 about.
+
+## Device Fix And Confirmation
+
+The device session is what made the first version fail, and it is worth recording why.
+
+The first beacon broadcast to `255.255.255.255`, and Windows picked the outgoing interface from the
+routing table. It picked `vEthernet (WSL)`, proven by capturing the packet and reading **its own
+source address**: `src=172.23.192.1`. The real LAN address was `192.168.1.27` on Ethernet, so the
+phone never saw it. Reading the packet's source settled it, after an initial and **wrong** hypothesis
+about the disconnected Wi-Fi adapter holding a stale same-subnet address.
+
+The fix derives the outgoing interface from the targets the operator already configured: a UDP
+`connect` with no data makes the OS choose the route, and `local_addr` reports the chosen source
+address. Binding the broadcast socket to that address pins the interface. Same command, same
+listener, before and after:
+
+| | Source | Packets |
+| --- | --- | --- |
+| Before | `172.23.192.1` (WSL) | 3 |
+| After | `192.168.1.27` (Ethernet) | 5, none from WSL |
+
+The beacon bytes were identical both times.
+
+Then on the device, with the app launched fresh and **nothing typed**:
+
+```
+Found servers
+[ 192.168.1.27:50001 ]
+```
+
+The correct address, and the control port taken from the beacon payload.
 
 ## Known Limitation
 
