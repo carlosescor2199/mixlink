@@ -1,6 +1,7 @@
 mod capture;
 mod cli;
 mod control;
+mod discovery;
 mod mix;
 mod network;
 mod protocol;
@@ -17,6 +18,7 @@ use cpal::traits::{HostTrait, StreamTrait};
 use crate::capture::{build_input_stream, select_device, select_input_config, TARGET_SAMPLE_RATE};
 use crate::cli::{parse_arguments, resolve_targets, validate_groups};
 use crate::control::spawn_control_thread;
+use crate::discovery::spawn_discovery_thread;
 use crate::mix::{GroupLayout, MixState};
 use crate::network::{spawn_network_thread, PacketStats};
 
@@ -79,6 +81,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         source_channels,
         Arc::clone(&group_layout),
     );
+    let discovery_thread = spawn_discovery_thread(
+        arguments.control_port,
+        TARGET_SAMPLE_RATE,
+        Arc::clone(&stopped),
+    )?;
     let (packet_sender, packet_receiver) = sync_channel(CHANNEL_CAPACITY);
     let packet_stats = Arc::new(PacketStats {
         sent: AtomicU64::new(0),
@@ -119,6 +126,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     control_thread
         .join()
         .map_err(|_| "control WebSocket thread panicked")?;
+    discovery_thread
+        .join()
+        .map_err(|_| "discovery beacon thread panicked")?;
     println!(
         "Capture stopped cleanly. Samples received: {}; packets sent: {}; packets discarded: {}.",
         samples_seen.load(Ordering::Relaxed),

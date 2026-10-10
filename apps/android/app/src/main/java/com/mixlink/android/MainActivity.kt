@@ -17,6 +17,8 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
     private lateinit var hostInput: EditText
     private lateinit var portInput: EditText
     private lateinit var controlPortInput: EditText
+    private lateinit var foundServersHeader: TextView
+    private lateinit var foundServersContainer: LinearLayout
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var statusText: TextView
@@ -57,6 +59,11 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         moreOfMeEnabled = { moreOfMeEnabled },
         musicianChannel = { musicianChannel },
     )
+    private val serverDiscovery = ServerDiscovery(object : ServerDiscovery.Listener {
+        override fun onServersChanged(servers: List<DiscoveredServer>) {
+            runOnUiThread { renderFoundServers(servers) }
+        }
+    })
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,6 +72,8 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         hostInput = findViewById(R.id.hostInput)
         portInput = findViewById(R.id.portInput)
         controlPortInput = findViewById(R.id.controlPortInput)
+        foundServersHeader = findViewById(R.id.foundServersHeader)
+        foundServersContainer = findViewById(R.id.foundServersContainer)
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
         statusText = findViewById(R.id.statusText)
@@ -129,6 +138,21 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
 
         startButton.setOnClickListener { startReceiver() }
         stopButton.setOnClickListener { stopReceiver() }
+        serverDiscovery.start()
+    }
+
+    /**
+     * Shows the found-servers section only when at least one server is advertising, so a client
+     * that hears no beacon is left exactly as it was before discovery existed. Tapping a row fills
+     * the address and control port and nothing else: a human still presses Start, and a field the
+     * musician is editing is never overwritten by a beacon.
+     */
+    private fun renderFoundServers(servers: List<DiscoveredServer>) {
+        foundServersHeader.visibility = if (servers.isEmpty()) View.GONE else View.VISIBLE
+        rebuildFoundServers(this, foundServersContainer, servers) { server ->
+            hostInput.setText(server.address)
+            controlPortInput.setText(server.controlPort.toString())
+        }
     }
 
     private fun startReceiver() {
@@ -155,6 +179,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         }
         lastError = "none"
         controlError = "none"
+        serverDiscovery.stop()
         running.set(true)
         startButton.isEnabled = false
         stopButton.isEnabled = true
@@ -183,6 +208,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         control.close(1000, "stopped")
         control.controlState = ControlState.IDLE
         renderControlStatus()
+        serverDiscovery.start()
     }
 
     private fun updateStats(
@@ -448,6 +474,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         stopReceiver()
         control.close(1000, "destroyed")
         control.shutdown()
+        serverDiscovery.shutdown()
         super.onDestroy()
     }
 }
