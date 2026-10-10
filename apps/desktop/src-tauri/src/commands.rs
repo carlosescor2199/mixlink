@@ -92,7 +92,8 @@ pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<Start
     }
 }
 
-/// Returns the engine's current status, with each musician row labelled from the name store.
+/// Returns the engine's current status, with each musician row's displayed name resolved by
+/// [apply_names].
 pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     let guard = state
         .engine
@@ -106,17 +107,22 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     Ok(status)
 }
 
-/// Fills each musician row's label: the engineer's local override when one exists, otherwise the
-/// name the client announced, joining on the address string.
+/// Fills each musician row's displayed name, joining the local label store on the address string.
+///
+/// The client's announced name wins: each musician sets their own name in their own app, and a
+/// stored label must not shadow it. The engineer's local label is the fallback for a client that
+/// never announced a name, such as a fixed rack added by address; `name_is_local` marks that case
+/// so the window can tell the two sources apart.
 ///
 /// Kept separate from [EngineStatusDto] so the DTO stays a pure translation of engine state and
 /// the desktop-only concern is applied in one place. The client's own name stays in `clientName`,
-/// so the window can still show what the phone calls itself.
-fn apply_names(status: &mut EngineStatusDto, names: &MusicianNames) {
+/// so the window can still show what the phone calls itself. Public so the headless probe can
+/// drive exactly the name resolution the window gets, without a webview.
+pub fn apply_names(status: &mut EngineStatusDto, names: &MusicianNames) {
     for musician in &mut status.musicians {
-        musician.name = names
-            .get(&musician.address)
-            .or_else(|| musician.client_name.clone());
+        let local = names.get(&musician.address);
+        musician.name_is_local = musician.client_name.is_none() && local.is_some();
+        musician.name = musician.client_name.clone().or(local);
     }
 }
 
@@ -160,7 +166,8 @@ pub fn remove_target(state: &DesktopState, address: String) -> Result<String, St
     Ok(removed.to_string())
 }
 
-/// Sets or clears a musician's label. The label never reaches the engine or any client.
+/// Sets or clears a musician's label. The label never reaches the engine or any client, and it is
+/// only shown for a client that has not announced a name of its own: a client's own name wins.
 pub fn set_musician_name(
     state: &DesktopState,
     address: String,
@@ -245,6 +252,7 @@ mod tests {
                     address: (*address).to_owned(),
                     client_name: None,
                     name: None,
+                    name_is_local: false,
                     control_connected: false,
                     volume_percent: 100,
                     max_level_percent: 100,
@@ -275,26 +283,53 @@ mod tests {
         apply_names(&mut status, &names);
 
         assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
+        assert!(status.musicians[0].name_is_local);
         assert_eq!(status.musicians[1].name, None);
+        assert!(!status.musicians[1].name_is_local);
     }
 
     #[test]
-    fn the_client_name_shows_until_the_engineer_sets_a_local_override() {
-        let names = MusicianNames::load(names_path("client-names"));
+    fn the_clients_own_name_beats_the_local_label() {
+        let names = MusicianNames::load(names_path("client-wins"));
+        names
+            .set("192.168.1.30:50000", "Lead vocal")
+            .expect("setting a name should persist");
         let mut status = status_with_musicians(&["192.168.1.30:50000"]);
         status.musicians[0].client_name = Some("Ana".to_owned());
 
         apply_names(&mut status, &names);
-        assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
 
+        // The phone is the authority on its own name: the desk's stored label must not shadow it,
+        // and the row must not report the label as if it were the name on screen.
+        assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
+        assert_eq!(status.musicians[0].client_name.as_deref(), Some("Ana"));
+        assert!(!status.musicians[0].name_is_local);
+    }
+
+    #[test]
+    fn a_local_label_applies_when_the_client_announced_nothing() {
+        let names = MusicianNames::load(names_path("silent-client"));
         names
-            .set("192.168.1.30:50000", "Lead vocal")
+            .set("192.168.1.30:50000", "Rack A")
             .expect("setting a name should persist");
+        let mut status = status_with_musicians(&["192.168.1.30:50000"]);
+
         apply_names(&mut status, &names);
 
-        assert_eq!(status.musicians[0].name.as_deref(), Some("Lead vocal"));
-        // The phone's own name is still reported beside the override.
-        assert_eq!(status.musicians[0].client_name.as_deref(), Some("Ana"));
+        assert_eq!(status.musicians[0].name.as_deref(), Some("Rack A"));
+        assert_eq!(status.musicians[0].client_name, None);
+        assert!(status.musicians[0].name_is_local);
+    }
+
+    #[test]
+    fn a_row_with_no_client_name_and_no_label_stays_unnamed() {
+        let names = MusicianNames::load(names_path("unnamed"));
+        let mut status = status_with_musicians(&["192.168.1.30:50000"]);
+
+        apply_names(&mut status, &names);
+
+        assert_eq!(status.musicians[0].name, None);
+        assert!(!status.musicians[0].name_is_local);
     }
 
     #[test]

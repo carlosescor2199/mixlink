@@ -251,20 +251,29 @@ function hideMusicianError() {
   els.musicianError.hidden = true;
 }
 
+// A row's name is either the client's own, announced from the phone, or the desk's local label.
+// The two tooltips state which one is on screen so the engineer never has to guess.
+const CLIENT_NAME_TITLE =
+  "Announced by the musician in their own app; the name is set on their phone, not on this desk";
+const LOCAL_LABEL_TITLE =
+  "Local label for this desk, shown only while the musician has not announced a name. Enter saves, Escape reverts";
+
 // Builds one musician row. The name input commits on blur (Enter blurs it, Escape reverts first),
-// and the poll never overwrites the input while it has focus.
+// and the poll never overwrites the input while it has focus. For a client that announced its own
+// name the input is disabled: the phone owns the name, and a local label would be shadowed anyway.
 function buildMusicianRow(musician) {
   const row = document.createElement("tr");
 
   const nameCell = document.createElement("td");
+  const nameWrap = document.createElement("div");
+  nameWrap.className = "name-cell";
   const nameInput = document.createElement("input");
   nameInput.type = "text";
   nameInput.className = "name-input";
   nameInput.placeholder = "unnamed";
   nameInput.value = musician.name || "";
   nameInput.dataset.saved = musician.name || "";
-  nameInput.title =
-    "Local label for this desk; the phone's own name shows when this is empty. Enter saves, Escape reverts";
+  nameInput.title = LOCAL_LABEL_TITLE;
   nameInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -275,6 +284,11 @@ function buildMusicianRow(musician) {
     }
   });
   nameInput.addEventListener("change", async () => {
+    // A disabled input means the client announced its own name: a label typed here would never
+    // show, so a late change event (e.g. from losing focus when the client announced) is ignored.
+    if (nameInput.disabled) {
+      return;
+    }
     try {
       await invoke("set_musician_name", {
         address: musician.address,
@@ -286,7 +300,14 @@ function buildMusicianRow(musician) {
       showMusicianError(`could not save the name: ${error}`);
     }
   });
-  nameCell.append(nameInput);
+  const localBadge = document.createElement("span");
+  localBadge.className = "local-badge";
+  localBadge.textContent = "local label";
+  localBadge.title =
+    "This musician has not announced a name; the desk is showing its own local label";
+  localBadge.hidden = true;
+  nameWrap.append(nameInput, localBadge);
+  nameCell.append(nameWrap);
 
   const controlCell = document.createElement("td");
   const controlDot = document.createElement("span");
@@ -322,12 +343,36 @@ function buildMusicianRow(musician) {
     loss,
     actions,
   );
-  return { row, nameInput, controlDot, controlLabel, mixVolume, mixState, sent, discarded, loss };
+  return {
+    row,
+    nameInput,
+    localBadge,
+    controlDot,
+    controlLabel,
+    mixVolume,
+    mixState,
+    sent,
+    discarded,
+    loss,
+  };
 }
 
 function updateMusicianRow(view, musician) {
   const total = musician.packetsSent + musician.packetsDiscarded;
   const loss = total === 0 ? 0 : (musician.packetsDiscarded / total) * 100;
+
+  // The name on screen has two possible sources. A client that announced a name owns it: the input
+  // becomes read-only text and a stored local label stays dormant. A client that announced nothing
+  // keeps an editable local label, and the badge marks it as the desk's own while it is in effect.
+  const fromClient = typeof musician.clientName === "string" && musician.clientName !== "";
+  if (fromClient || document.activeElement !== view.nameInput) {
+    const name = musician.name || "";
+    view.nameInput.value = name;
+    view.nameInput.dataset.saved = name;
+  }
+  view.nameInput.disabled = fromClient;
+  view.nameInput.title = fromClient ? CLIENT_NAME_TITLE : LOCAL_LABEL_TITLE;
+  view.localBadge.hidden = !musician.nameIsLocal;
 
   view.controlDot.className = musician.controlConnected ? "dot dot--on" : "dot";
   view.controlLabel.textContent = musician.controlConnected ? "connected" : "offline";
@@ -339,12 +384,6 @@ function updateMusicianRow(view, musician) {
   view.discarded.textContent = formatNumber(musician.packetsDiscarded);
   view.loss.textContent = `${loss.toFixed(2)}%`;
   view.loss.className = loss > 0 ? "num warn" : "num";
-
-  if (document.activeElement !== view.nameInput) {
-    const name = musician.name || "";
-    view.nameInput.value = name;
-    view.nameInput.dataset.saved = name;
-  }
 }
 
 function renderMusicians(musicians) {

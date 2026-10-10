@@ -79,9 +79,13 @@ pub struct MusicianDto {
     /// The name the musician typed on their phone and announced when registering, straight from the
     /// engine. It is client input, never a desktop label, and is never sent back to a client.
     pub client_name: Option<String>,
-    /// The label this desk shows: the engineer's local override when one exists, otherwise the
-    /// client's own name. Filled by the command layer; the engine knows nothing of the override.
+    /// The name this desk shows: the client's own announced name when it has one, otherwise the
+    /// engineer's local label. Filled by the command layer; the engine knows nothing of the label.
     pub name: Option<String>,
+    /// True when `name` is the desk's local label rather than the client's announced name, so the
+    /// window can mark it as local. It is only ever true when the client announced no name; a
+    /// client that announced one always wins, which is why the two cases need telling apart.
+    pub name_is_local: bool,
     pub control_connected: bool,
     pub volume_percent: u8,
     pub max_level_percent: u8,
@@ -140,6 +144,7 @@ impl From<&MusicianStatus> for MusicianDto {
             address: musician.address.to_string(),
             client_name: musician.name.clone(),
             name: None,
+            name_is_local: false,
             control_connected: musician.control_connected,
             volume_percent: musician.mix.volume_percent,
             max_level_percent: musician.mix.max_level_percent,
@@ -303,6 +308,7 @@ mod tests {
 
         assert_eq!(dto.client_name.as_deref(), Some("Ana"));
         assert_eq!(dto.name, None);
+        assert!(!dto.name_is_local);
     }
 
     #[test]
@@ -319,6 +325,7 @@ mod tests {
 
         assert_eq!(dto.client_name, None);
         assert_eq!(dto.name, None);
+        assert!(!dto.name_is_local);
     }
 
     #[test]
