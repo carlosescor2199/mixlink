@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MixLink Server</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main>
+      <h1>MixLink server</h1>
+      <p id="status" class="status">Starting engine…</p>
+
+      <dl class="facts">
+        <dt>Device</dt>
+        <dd id="device">—</dd>
+        <dt>Capture format</dt>
+        <dd id="format">—</dd>
+      </dl>
+
+      <div class="actions">
+        <button id="refresh" type="button">Refresh status</button>
+        <button id="stop" type="button">Stop engine</button>
+      </div>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>
