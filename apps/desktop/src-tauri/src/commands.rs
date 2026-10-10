@@ -106,13 +106,17 @@ pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     Ok(status)
 }
 
-/// Fills each musician row's label from the desktop-only store, joining on the address string.
+/// Fills each musician row's label: the engineer's local override when one exists, otherwise the
+/// name the client announced, joining on the address string.
 ///
 /// Kept separate from [EngineStatusDto] so the DTO stays a pure translation of engine state and
-/// the desktop-only concern is applied in one place.
+/// the desktop-only concern is applied in one place. The client's own name stays in `clientName`,
+/// so the window can still show what the phone calls itself.
 fn apply_names(status: &mut EngineStatusDto, names: &MusicianNames) {
     for musician in &mut status.musicians {
-        musician.name = names.get(&musician.address);
+        musician.name = names
+            .get(&musician.address)
+            .or_else(|| musician.client_name.clone());
     }
 }
 
@@ -239,6 +243,7 @@ mod tests {
                 .iter()
                 .map(|address| MusicianDto {
                     address: (*address).to_owned(),
+                    client_name: None,
                     name: None,
                     control_connected: false,
                     volume_percent: 100,
@@ -271,6 +276,25 @@ mod tests {
 
         assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
         assert_eq!(status.musicians[1].name, None);
+    }
+
+    #[test]
+    fn the_client_name_shows_until_the_engineer_sets_a_local_override() {
+        let names = MusicianNames::load(names_path("client-names"));
+        let mut status = status_with_musicians(&["192.168.1.30:50000"]);
+        status.musicians[0].client_name = Some("Ana".to_owned());
+
+        apply_names(&mut status, &names);
+        assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
+
+        names
+            .set("192.168.1.30:50000", "Lead vocal")
+            .expect("setting a name should persist");
+        apply_names(&mut status, &names);
+
+        assert_eq!(status.musicians[0].name.as_deref(), Some("Lead vocal"));
+        // The phone's own name is still reported beside the override.
+        assert_eq!(status.musicians[0].client_name.as_deref(), Some("Ana"));
     }
 
     #[test]

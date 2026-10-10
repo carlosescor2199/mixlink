@@ -76,27 +76,35 @@
       <section class="panel panel--musicians">
         <h2 class="panel-title">
           Musicians
-          <span id="musician-count" class="panel-note">0 configured</span>
+          <span id="musician-count" class="panel-note">0 musicians</span>
         </h2>
-        <form id="add-musician" class="add-form">
-          <input
-            id="new-target"
-            class="input mono"
-            type="text"
-            placeholder="192.168.1.50:50000"
-            autocomplete="off"
-            spellcheck="false"
-            aria-label="New musician address"
-          />
-          <button type="submit" class="button">Add musician</button>
-          <span id="musician-error" class="form-error" hidden></span>
-        </form>
         <p class="hint">
-          Adding or removing a musician never restarts the server: the capture stream, the control
-          server and the discovery beacon keep running. Removing stops that musician's audio
-          immediately; their control channel stays open and their next mix is answered with
-          "no UDP target configured for client IP". Names are labels for this desk only.
+          Musicians appear here as they connect and announce themselves. The name comes from the
+          phone; typing a name in a row is a local label for this desk only and is never sent to
+          the client.
         </p>
+        <details class="advanced">
+          <summary>Advanced: add a musician by address</summary>
+          <form id="add-musician" class="add-form">
+            <input
+              id="new-target"
+              class="input mono"
+              type="text"
+              placeholder="192.168.1.50:50000"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="New musician address"
+            />
+            <button type="submit" class="button">Add musician</button>
+            <span id="musician-error" class="form-error" hidden></span>
+          </form>
+          <p class="hint">
+            For a fixed rack or for debugging. Adding or removing a musician never restarts the
+            server: the capture stream, the control server and the discovery beacon keep running.
+            Removing stops that musician's audio immediately; their control channel stays open and
+            their next mix is answered with "no UDP target configured for client IP".
+          </p>
+        </details>
         <div class="table-wrap">
           <table class="musicians">
             <colgroup>
@@ -124,7 +132,9 @@
             <tbody id="musicians"></tbody>
           </table>
         </div>
-        <p id="musicians-empty" class="empty">No musicians configured. Add one by address above.</p>
+        <p id="musicians-empty" class="empty">
+          No musicians connected yet. A phone that finds this server appears here on its own.
+        </p>
       </section>
     </main>
 

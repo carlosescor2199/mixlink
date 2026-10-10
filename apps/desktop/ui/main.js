@@ -263,7 +263,8 @@ function buildMusicianRow(musician) {
   nameInput.placeholder = "unnamed";
   nameInput.value = musician.name || "";
   nameInput.dataset.saved = musician.name || "";
-  nameInput.title = "Label this musician; Enter saves, Escape reverts";
+  nameInput.title =
+    "Local label for this desk; the phone's own name shows when this is empty. Enter saves, Escape reverts";
   nameInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -347,7 +348,9 @@ function updateMusicianRow(view, musician) {
 }
 
 function renderMusicians(musicians) {
-  els.musicianCount.textContent = `${musicians.length} configured`;
+  els.musicianCount.textContent = `${musicians.length} ${
+    musicians.length === 1 ? "musician" : "musicians"
+  }`;
 
   if (musicians.length === 0) {
     musicianViews.clear();

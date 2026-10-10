@@ -1,9 +1,10 @@
-use std::error::Error;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use crate::targets::TargetRegistry;
 
 /// Discovery beacon datagram format, version 1:
 /// magic[4] | version[1] | control_port[2 LE] | sample_rate[4 LE]
@@ -109,51 +110,104 @@ fn derive_local_addresses(
     addresses
 }
 
-/// Builds one broadcast socket per distinct outgoing interface, each bound to that interface's
-/// local address so the OS cannot pick another one.
+/// The destination whose route stands in for the default route.
 ///
-/// When no local address can be derived, it falls back to today's single unbound `0.0.0.0` socket,
-/// so a default-target-only server still advertises on the broadcast address.
-fn build_broadcast_senders(targets: &[SocketAddr]) -> Result<Vec<UdpSocket>, Box<dyn Error>> {
+/// It is never contacted: `connect` on a UDP socket only asks the OS which interface it would use,
+/// so no packet leaves the machine and no DNS lookup happens. A public address is used because
+/// every host with a default route has one for it, including a LAN-only host behind a gateway.
+fn default_route_probe() -> SocketAddr {
+    SocketAddr::from(([8, 8, 8, 8], 53))
+}
+
+/// The local address of the default route, resolved without sending a byte.
+///
+/// This is what keeps the beacon alive when no target can derive an interface: the desktop starts
+/// with an empty musician list, and the unbound `255.255.255.255` send would leave through
+/// whichever adapter Windows prefers (on a machine with WSL, the WSL adapter) instead of the LAN.
+fn default_route_address() -> Option<IpAddr> {
+    local_address_for(default_route_probe())
+}
+
+/// The interfaces the beacon broadcasts from: the routes to the live targets plus the default
+/// route, deduplicated, with loopback and unspecified addresses dropped.
+///
+/// The default route matters most when no target is configured at all: the desktop starts with an
+/// empty musician list, and without it the thread falls back to the unbound broadcast, which on a
+/// machine with a WSL adapter leaves through the wrong interface.
+pub(crate) fn beacon_interfaces(
+    targets: &[SocketAddr],
+    resolve: impl Fn(SocketAddr) -> Option<IpAddr>,
+    resolve_default: impl Fn() -> Option<IpAddr>,
+) -> Vec<IpAddr> {
+    let mut addresses = derive_local_addresses(targets, resolve);
+    if let Some(address) = resolve_default() {
+        if !address.is_loopback() && !address.is_unspecified() && !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
+}
+
+/// Builds one broadcast socket per interface address, each bound to that address so the OS cannot
+/// pick another one.
+///
+/// When no interface address is known (or none can be bound), it falls back to a single unbound
+/// `0.0.0.0` socket, so the beacon still advertises on the limited broadcast.
+fn build_broadcast_senders(addresses: &[IpAddr]) -> Vec<UdpSocket> {
     let mut senders = Vec::new();
-    for address in derive_local_addresses(targets, local_address_for) {
+    for &address in addresses {
         if !address.is_ipv4() {
             // The beacon destination is the IPv4 limited broadcast, so an IPv6 local address cannot
             // carry it.
             continue;
         }
-        let socket = UdpSocket::bind(SocketAddr::new(address, 0))?;
-        socket.set_broadcast(true)?;
-        senders.push(socket);
+        match UdpSocket::bind(SocketAddr::new(address, 0)) {
+            Ok(socket) => match socket.set_broadcast(true) {
+                Ok(()) => senders.push(socket),
+                Err(error) => eprintln!("discovery beacon setup error for {address}: {error}"),
+            },
+            Err(error) => eprintln!("discovery beacon bind error for {address}: {error}"),
+        }
     }
     if senders.is_empty() {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.set_broadcast(true)?;
-        senders.push(socket);
+        match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => {
+                if let Err(error) = socket.set_broadcast(true) {
+                    eprintln!("discovery beacon setup error: {error}");
+                }
+                senders.push(socket);
+            }
+            Err(error) => eprintln!("discovery beacon bind error: {error}"),
+        }
     }
-    Ok(senders)
+    senders
 }
 
 /// Broadcasts the beacon every [BEACON_INTERVAL] until [stopped] turns true, so it starts and stops
 /// with the server exactly as the control thread does.
 ///
-/// `targets` are the operator-configured UDP destinations; they exist only to discover the outgoing
-/// interfaces, and the fixed 11-byte datagram is unchanged.
+/// The interfaces are derived fresh on every tick from the live target table and the default route,
+/// never from a list captured at startup: the desktop begins with no musicians at all, and a
+/// target added or removed at runtime changes which interfaces can carry the broadcast. The fixed
+/// 11-byte datagram, its port and its interval are unchanged.
 pub(crate) fn spawn_discovery_thread(
-    targets: &[SocketAddr],
+    targets: Arc<TargetRegistry>,
     control_port: u16,
     sample_rate: u32,
     stopped: Arc<AtomicBool>,
-) -> Result<JoinHandle<()>, Box<dyn Error>> {
-    let senders = build_broadcast_senders(targets)?;
+) -> JoinHandle<()> {
     let datagram = encode_beacon(Beacon {
         control_port,
         sample_rate,
     });
     let destination = SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT));
-    Ok(thread::spawn(move || {
+    thread::spawn(move || {
         while !stopped.load(Ordering::Relaxed) {
-            for socket in &senders {
+            let live_targets: Vec<SocketAddr> =
+                targets.read().iter().map(|entry| entry.address).collect();
+            let addresses =
+                beacon_interfaces(&live_targets, local_address_for, default_route_address);
+            for socket in build_broadcast_senders(&addresses) {
                 if let Err(error) = socket.send_to(&datagram, destination) {
                     eprintln!("discovery beacon send error: {error}");
                 }
@@ -167,7 +221,7 @@ pub(crate) fn spawn_discovery_thread(
                 waited += step;
             }
         }
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -271,5 +325,74 @@ mod tests {
         let addresses = derive_local_addresses(&targets, resolve);
 
         assert_eq!(addresses, vec!["192.168.1.27".parse::<IpAddr>().unwrap()]);
+    }
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().expect("test IP should parse")
+    }
+
+    /// The desktop case: the musician list is empty, so only the default route can keep the beacon
+    /// on the live LAN instead of the unbound broadcast Windows routes through the WSL adapter.
+    #[test]
+    fn the_default_route_carries_the_beacon_when_no_targets_are_configured() {
+        let addresses = beacon_interfaces(
+            &[],
+            |_| unreachable!("there are no targets to resolve"),
+            || Some(ip("192.168.1.27")),
+        );
+
+        assert_eq!(addresses, vec![ip("192.168.1.27")]);
+    }
+
+    #[test]
+    fn the_default_route_is_added_after_the_target_interfaces() {
+        let targets = ["192.168.1.50:50000".parse().unwrap()];
+        let resolve = |_target: SocketAddr| Some(ip("10.0.0.2"));
+
+        let addresses = beacon_interfaces(&targets, resolve, || Some(ip("192.168.1.27")));
+
+        assert_eq!(addresses, vec![ip("10.0.0.2"), ip("192.168.1.27")]);
+    }
+
+    #[test]
+    fn the_default_route_is_not_duplicated_when_a_target_already_uses_it() {
+        let targets = ["192.168.1.50:50000".parse().unwrap()];
+        let resolve = |_target: SocketAddr| Some(ip("192.168.1.27"));
+
+        let addresses = beacon_interfaces(&targets, resolve, || Some(ip("192.168.1.27")));
+
+        assert_eq!(addresses, vec![ip("192.168.1.27")]);
+    }
+
+    #[test]
+    fn a_loopback_or_unspecified_default_route_is_dropped() {
+        assert!(beacon_interfaces(&[], |_| None, || Some(ip("127.0.0.1"))).is_empty());
+        assert!(beacon_interfaces(&[], |_| None, || Some(ip("0.0.0.0"))).is_empty());
+    }
+
+    #[test]
+    fn an_unresolvable_default_route_leaves_only_the_target_interfaces() {
+        let targets = ["192.168.1.50:50000".parse().unwrap()];
+        let resolve = |_target: SocketAddr| Some(ip("10.0.0.2"));
+
+        let addresses = beacon_interfaces(&targets, resolve, || None);
+
+        assert_eq!(addresses, vec![ip("10.0.0.2")]);
+    }
+
+    #[test]
+    fn one_sender_is_bound_per_interface_address() {
+        let senders = build_broadcast_senders(&[ip("127.0.0.1")]);
+
+        assert_eq!(senders.len(), 1);
+        assert_eq!(senders[0].local_addr().unwrap().ip(), ip("127.0.0.1"));
+    }
+
+    #[test]
+    fn the_unbound_fallback_socket_is_used_only_when_no_interface_is_known() {
+        let senders = build_broadcast_senders(&[]);
+
+        assert_eq!(senders.len(), 1);
+        assert!(senders[0].local_addr().unwrap().ip().is_unspecified());
     }
 }

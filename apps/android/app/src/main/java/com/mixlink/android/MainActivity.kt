@@ -2,6 +2,8 @@ package com.mixlink.android
 
 import android.app.Activity
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.View
 import android.widget.AdapterView
 import android.widget.Button
@@ -14,6 +16,7 @@ import android.widget.TextView
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
+    private lateinit var musicianNameInput: EditText
     private lateinit var hostInput: EditText
     private lateinit var portInput: EditText
     private lateinit var controlPortInput: EditText
@@ -69,6 +72,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        musicianNameInput = findViewById(R.id.musicianNameInput)
         hostInput = findViewById(R.id.hostInput)
         portInput = findViewById(R.id.portInput)
         controlPortInput = findViewById(R.id.controlPortInput)
@@ -98,6 +102,18 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
 
         bankStore = MixBankStore(this)
         musicianChannel = bankStore.musicianChannel()
+        // The name is remembered the same way the musician channel is: restored here, saved as it
+        // is typed, and sent with the registration when the control channel opens.
+        musicianNameInput.setText(bankStore.musicianName())
+        musicianNameInput.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+
+            override fun afterTextChanged(s: Editable?) {
+                bankStore.setMusicianName(s?.toString() ?: "")
+            }
+        })
         saveBankButton.setOnClickListener { saveCurrentBank() }
         moreOfMeCheckBox.setOnCheckedChangeListener { _, checked -> onMoreOfMeToggled(checked) }
         musicianChannelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -183,6 +199,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         running.set(true)
         startButton.isEnabled = false
         stopButton.isEnabled = true
+        musicianNameInput.isEnabled = false
         hostInput.isEnabled = false
         portInput.isEnabled = false
         controlPortInput.isEnabled = false
@@ -191,7 +208,9 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         control.controlState = ControlState.CONNECTING
         control.clearMixOwnership()
         renderControlStatus()
-        control.connect(host, controlPort)
+        // The name and the UDP port this client listens on travel in the registration, so the
+        // server can add this musician as a target without anyone typing an address.
+        control.connect(host, controlPort, port, musicianNameInput.text.toString())
 
         player.launch(host, port)
     }
@@ -202,6 +221,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         statusText.text = "Status: Stopping"
         startButton.isEnabled = true
         stopButton.isEnabled = false
+        musicianNameInput.isEnabled = true
         hostInput.isEnabled = true
         portInput.isEnabled = true
         controlPortInput.isEnabled = true
@@ -439,6 +459,7 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         runOnUiThread {
             startButton.isEnabled = true
             stopButton.isEnabled = false
+            musicianNameInput.isEnabled = true
             hostInput.isEnabled = true
             portInput.isEnabled = true
             controlPortInput.isEnabled = true

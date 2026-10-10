@@ -1,9 +1,42 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 
 use crate::mix::{GroupLayout, MixState};
 use crate::network::TargetCounters;
+
+/// How long a registered target survives after its last control channel closes.
+///
+/// A phone that loses the socket for a moment (a Wi-Fi roam, a screen lock) must not lose its
+/// audio: the target keeps streaming through the blip and is removed only when the channel stays
+/// gone for this long. Fifteen seconds covers the reconnect blips seen in practice while a client
+/// that really left stops being a target within a glance.
+pub(crate) const REGISTRATION_GRACE_PERIOD: Duration = Duration::from_secs(15);
+
+/// Where a target came from.
+///
+/// Only a target a client registered is removed when its control channel stays gone: a configured
+/// target is the engineer's (a rack or a debugging address) and is never auto-removed.
+pub(crate) enum TargetOrigin {
+    Configured,
+    Registered {
+        /// The name the client announced, if it typed one.
+        name: Option<String>,
+        /// When the last control channel for this target closed; `None` while connected or while
+        /// the grace period has not started.
+        disconnected_at: Option<Instant>,
+    },
+}
+
+impl TargetOrigin {
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            TargetOrigin::Configured => None,
+            TargetOrigin::Registered { name, .. } => name.as_deref(),
+        }
+    }
+}
 
 /// One configured musician destination: the UDP address plus the state that belongs to it.
 ///
@@ -14,6 +47,7 @@ pub(crate) struct TargetEntry {
     pub(crate) address: SocketAddr,
     pub(crate) mix_state: Arc<MixState>,
     pub(crate) counters: Arc<TargetCounters>,
+    pub(crate) origin: TargetOrigin,
 }
 
 /// The live routing table: which UDP targets exist, each with its mix state and send counters.
@@ -47,11 +81,92 @@ impl TargetRegistry {
                 address: *target,
                 mix_state: Arc::new(MixState::new(layout)),
                 counters: Arc::new(TargetCounters::default()),
+                origin: TargetOrigin::Configured,
             });
         }
         Ok(Self {
             entries: RwLock::new(entries),
         })
+    }
+
+    /// Adds or updates the target a client announced over the control channel.
+    ///
+    /// The address is built from the socket's peer IP and the announced UDP port; the message
+    /// carries no address, so a client cannot claim another's. Re-registering the same IP updates
+    /// the announced port and name, keeps the mix state and counters, and cancels any pending
+    /// removal from the grace period. A configured target at the same IP is adopted by the
+    /// registration, because the client that is actually there is the authority on where its own
+    /// audio should go.
+    pub(crate) fn register(
+        &self,
+        peer: IpAddr,
+        udp_port: u16,
+        name: Option<String>,
+        layout: &GroupLayout,
+    ) -> SocketAddr {
+        let address = SocketAddr::new(peer, udp_port);
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        if let Some(existing) = entries.iter_mut().find(|entry| entry.address.ip() == peer) {
+            existing.address = address;
+            existing.origin = TargetOrigin::Registered {
+                name,
+                disconnected_at: None,
+            };
+            return address;
+        }
+        entries.push(TargetEntry {
+            address,
+            mix_state: Arc::new(MixState::new(layout)),
+            counters: Arc::new(TargetCounters::default()),
+            origin: TargetOrigin::Registered {
+                name,
+                disconnected_at: None,
+            },
+        });
+        address
+    }
+
+    /// Marks a registered target as disconnected, starting its grace period.
+    ///
+    /// Called when the last control channel for the IP closes. A configured target is left alone:
+    /// the engineer owns it and it is never auto-removed.
+    pub(crate) fn mark_disconnected(&self, ip: IpAddr, now: Instant) {
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        for entry in entries.iter_mut() {
+            if entry.address.ip() != ip {
+                continue;
+            }
+            if let TargetOrigin::Registered {
+                disconnected_at, ..
+            } = &mut entry.origin
+            {
+                *disconnected_at = Some(now);
+            }
+        }
+    }
+
+    /// Removes registered targets whose grace period has elapsed, returning what was removed.
+    ///
+    /// Called from the control server's accept loop, which already ticks a few times a second, so
+    /// the removal happens without a thread of its own. Configured targets and registered targets
+    /// that reconnected (or re-registered) are kept.
+    pub(crate) fn sweep_expired(&self, now: Instant) -> Vec<SocketAddr> {
+        let mut entries = self.entries.write().expect("target registry lock poisoned");
+        let mut removed = Vec::new();
+        entries.retain(|entry| {
+            if let TargetOrigin::Registered {
+                disconnected_at: Some(at),
+                ..
+            } = entry.origin
+            {
+                if now.duration_since(at) >= REGISTRATION_GRACE_PERIOD {
+                    removed.push(entry.address);
+                    return false;
+                }
+            }
+            true
+        });
+        removed
     }
 
     /// A read view of the current table. Callers iterate it; no entry is ever mutated in place.
@@ -81,6 +196,7 @@ impl TargetRegistry {
             address,
             mix_state: Arc::new(MixState::new(layout)),
             counters: Arc::new(TargetCounters::default()),
+            origin: TargetOrigin::Configured,
         });
         Ok(address)
     }
@@ -303,5 +419,148 @@ mod tests {
             error.contains("not-an-address"),
             "message should name the value: {error}"
         );
+    }
+
+    fn registered_name(registry: &TargetRegistry, address: IpAddr) -> Option<String> {
+        registry
+            .read()
+            .iter()
+            .find(|entry| entry.address.ip() == address)
+            .and_then(|entry| entry.origin.name().map(str::to_owned))
+    }
+
+    #[test]
+    fn a_registration_adds_a_target_at_the_socket_ip_with_the_announced_port() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+
+        let added = registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+
+        assert_eq!(added, address("192.168.1.50:50000"));
+        assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
+        assert_eq!(
+            registered_name(&registry, ip("192.168.1.50")).as_deref(),
+            Some("Ana")
+        );
+    }
+
+    #[test]
+    fn a_registration_cannot_claim_an_address_other_than_the_socket_ip() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        // The claimed address is not part of the wire shape; if a client sends one it is ignored
+        // and the target is built from the socket's IP.
+        let command = crate::protocol::parse_register_command(
+            r#"{"type":"register","name":"Mallory","udp_port":50000,"address":"10.0.0.99:50000","ip":"10.0.0.99"}"#,
+        )
+        .expect("the extra fields must be ignored");
+
+        let added = registry.register(
+            ip("192.168.1.50"),
+            command.udp_port,
+            Some("Mallory".to_owned()),
+            &GroupLayout::default(),
+        );
+
+        assert_eq!(added, address("192.168.1.50:50000"));
+        assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
+        assert!(
+            registry
+                .read()
+                .iter()
+                .all(|entry| entry.address.ip() != ip("10.0.0.99")),
+            "the claimed address must not become a target"
+        );
+    }
+
+    #[test]
+    fn a_registered_target_survives_a_brief_disconnect() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+        let now = Instant::now();
+
+        registry.mark_disconnected(ip("192.168.1.50"), now);
+
+        // Inside the grace period the target is still there, so the musician's audio is not cut.
+        assert!(registry
+            .sweep_expired(now + REGISTRATION_GRACE_PERIOD - Duration::from_millis(1))
+            .is_empty());
+        assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
+    }
+
+    #[test]
+    fn a_registered_target_is_removed_after_the_grace_period() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+        let now = Instant::now();
+
+        registry.mark_disconnected(ip("192.168.1.50"), now);
+
+        let removed = registry.sweep_expired(now + REGISTRATION_GRACE_PERIOD);
+
+        assert_eq!(removed, vec![address("192.168.1.50:50000")]);
+        assert!(addresses(&registry).is_empty());
+    }
+
+    #[test]
+    fn re_registration_during_the_grace_period_cancels_the_removal_and_keeps_the_mix() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+        let mix = registry
+            .mix_state(ip("192.168.1.50"))
+            .expect("registered target");
+        registry.mark_disconnected(ip("192.168.1.50"), Instant::now());
+
+        // The client comes back before the grace expires, announcing a new listening port.
+        let updated = registry.register(
+            ip("192.168.1.50"),
+            50123,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+
+        assert_eq!(updated, address("192.168.1.50:50123"));
+        assert!(Arc::ptr_eq(
+            &mix,
+            &registry.mix_state(ip("192.168.1.50")).expect("kept target")
+        ));
+        // Long after the original grace would have expired, the cancelled removal never fires.
+        assert!(registry
+            .sweep_expired(Instant::now() + REGISTRATION_GRACE_PERIOD * 2)
+            .is_empty());
+        assert_eq!(addresses(&registry), vec![address("192.168.1.50:50123")]);
+    }
+
+    #[test]
+    fn a_configured_target_is_never_removed_by_the_grace_period() {
+        let registry =
+            TargetRegistry::new(&[address("192.168.1.50:50000")], &GroupLayout::default())
+                .expect("registry should build");
+        let now = Instant::now();
+
+        registry.mark_disconnected(ip("192.168.1.50"), now);
+
+        assert!(registry
+            .sweep_expired(now + REGISTRATION_GRACE_PERIOD * 10)
+            .is_empty());
+        assert_eq!(addresses(&registry), vec![address("192.168.1.50:50000")]);
     }
 }

@@ -36,6 +36,7 @@ internal class ControlChannel(
     private val httpClient = OkHttpClient()
 
     @Volatile private var controlWebSocket: WebSocket? = null
+    @Volatile private var registrationMessage: String? = null
     @Volatile var controlState = ControlState.IDLE
     @Volatile var mixAcknowledged = false
         private set
@@ -45,6 +46,9 @@ internal class ControlChannel(
             controlWebSocket = webSocket
             controlState = ControlState.CONNECTED
             listener.onOpened()
+            // Registration goes first: the server adds this client as a target from it, so the mix
+            // that follows finds a target to join.
+            sendRegistration()
             sendCurrentMix()
         }
 
@@ -83,7 +87,13 @@ internal class ControlChannel(
         }
     }
 
-    fun connect(host: String, port: Int) {
+    /**
+     * Opens the control channel and remembers what to announce when it opens: the musician's name
+     * and the UDP port this client listens on. A server that does not understand the registration
+     * answers with an error or ignores it, and the rest of the session behaves as before.
+     */
+    fun connect(host: String, port: Int, udpPort: Int, musicianName: String) {
+        registrationMessage = buildRegisterMessage(musicianName, udpPort)
         controlExecutor.execute {
             try {
                 val request = Request.Builder()
@@ -92,6 +102,20 @@ internal class ControlChannel(
                 httpClient.newWebSocket(request, controlListener)
             } catch (error: Exception) {
                 if (running.get()) listener.onControlError("Could not start WebSocket: ${error.message ?: "unknown error"}")
+            }
+        }
+    }
+
+    /**
+     * Sends the registration once, on open, ahead of the first mix. Queued on the same executor as
+     * the mix sends, so the server always sees the registration first.
+     */
+    private fun sendRegistration() {
+        val message = registrationMessage ?: return
+        controlExecutor.execute {
+            val webSocket = controlWebSocket ?: return@execute
+            if (!webSocket.send(message) && running.get()) {
+                listener.onControlError("WebSocket rejected the registration")
             }
         }
     }
@@ -166,6 +190,17 @@ internal class ControlChannel(
             .toString()
     }
 }
+
+/**
+ * Builds the registration message a client sends when the control channel opens: its name and the
+ * UDP port it listens on. The server takes the address from the socket, so none is carried here.
+ */
+internal fun buildRegisterMessage(name: String, udpPort: Int): String =
+    JSONObject()
+        .put("type", "register")
+        .put("name", name.trim())
+        .put("udp_port", udpPort)
+        .toString()
 
 /**
  * Reads the `groups` array from a `config` message. Missing or malformed entries are skipped, and a

@@ -51,10 +51,22 @@ class MixBankStore(context: Context) {
         preferences.edit().putInt(KEY_MUSICIAN_CHANNEL, channel ?: NO_CHANNEL).apply()
     }
 
+    /**
+     * The musician's name, remembered across app restarts exactly like the musician channel.
+     * Empty until one is typed; the registration still goes out, just unnamed.
+     */
+    fun musicianName(): String = preferences.getString(KEY_MUSICIAN_NAME, "") ?: ""
+
+    /** Saves the musician's name. Whitespace is trimmed; an empty name is stored as empty. */
+    fun setMusicianName(name: String) {
+        preferences.edit().putString(KEY_MUSICIAN_NAME, name.trim()).apply()
+    }
+
     private companion object {
         const val PREFERENCES_NAME = "mixlink_banks"
         const val KEY_BANKS = "banks"
         const val KEY_MUSICIAN_CHANNEL = "musician_channel"
+        const val KEY_MUSICIAN_NAME = "musician_name"
         const val NO_CHANNEL = -1
     }
 }

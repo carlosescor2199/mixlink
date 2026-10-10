@@ -76,8 +76,11 @@ pub struct StartSummary {
 #[serde(rename_all = "camelCase")]
 pub struct MusicianDto {
     pub address: String,
-    /// The engineer's label, filled by the command layer from the desktop-only name store. The
-    /// engine knows nothing about it; it is never sent to a client.
+    /// The name the musician typed on their phone and announced when registering, straight from the
+    /// engine. It is client input, never a desktop label, and is never sent back to a client.
+    pub client_name: Option<String>,
+    /// The label this desk shows: the engineer's local override when one exists, otherwise the
+    /// client's own name. Filled by the command layer; the engine knows nothing of the override.
     pub name: Option<String>,
     pub control_connected: bool,
     pub volume_percent: u8,
@@ -135,6 +138,7 @@ impl From<&MusicianStatus> for MusicianDto {
     fn from(musician: &MusicianStatus) -> Self {
         Self {
             address: musician.address.to_string(),
+            client_name: musician.name.clone(),
             name: None,
             control_connected: musician.control_connected,
             volume_percent: musician.mix.volume_percent,
@@ -286,9 +290,10 @@ mod tests {
     }
 
     #[test]
-    fn a_musician_has_no_name_until_the_desktop_layer_fills_it() {
+    fn the_engine_name_becomes_the_client_name_and_the_label_is_left_to_the_command_layer() {
         let musician = MusicianStatus {
             address: "192.168.1.30:50000".parse().expect("test address"),
+            name: Some("Ana".to_owned()),
             control_connected: false,
             mix: Default::default(),
             counters: Default::default(),
@@ -296,6 +301,23 @@ mod tests {
 
         let dto = MusicianDto::from(&musician);
 
+        assert_eq!(dto.client_name.as_deref(), Some("Ana"));
+        assert_eq!(dto.name, None);
+    }
+
+    #[test]
+    fn a_musician_that_never_announced_a_name_reports_no_client_name() {
+        let musician = MusicianStatus {
+            address: "192.168.1.30:50000".parse().expect("test address"),
+            name: None,
+            control_connected: false,
+            mix: Default::default(),
+            counters: Default::default(),
+        };
+
+        let dto = MusicianDto::from(&musician);
+
+        assert_eq!(dto.client_name, None);
         assert_eq!(dto.name, None);
     }
 

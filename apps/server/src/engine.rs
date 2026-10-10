@@ -62,6 +62,11 @@ pub struct MusicianCounters {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MusicianStatus {
     pub address: SocketAddr,
+    /// The name the musician typed on their own app and announced when registering, if any.
+    ///
+    /// It is client input, not configuration: the desktop may show its own local label instead,
+    /// but this is the name that travelled from the phone.
+    pub name: Option<String>,
     pub control_connected: bool,
     pub mix: MixValues,
     pub counters: MusicianCounters,
@@ -145,6 +150,7 @@ pub(crate) fn join_musicians(
     connected: &HashSet<IpAddr>,
     counters: &HashMap<IpAddr, MusicianCounters>,
     mixes: &HashMap<IpAddr, MixValues>,
+    names: &HashMap<IpAddr, String>,
 ) -> Vec<MusicianStatus> {
     targets
         .iter()
@@ -152,6 +158,7 @@ pub(crate) fn join_musicians(
             let ip = address.ip();
             MusicianStatus {
                 address: *address,
+                name: names.get(&ip).cloned(),
                 control_connected: connected.contains(&ip),
                 mix: mixes.get(&ip).copied().unwrap_or_default(),
                 counters: counters.get(&ip).copied().unwrap_or_default(),
@@ -437,6 +444,15 @@ impl EngineHandle {
             .iter()
             .map(|entry| (entry.address.ip(), entry.mix_state.snapshot()))
             .collect();
+        let names: HashMap<IpAddr, String> = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .origin
+                    .name()
+                    .map(|name| (entry.address.ip(), name.to_owned()))
+            })
+            .collect();
         EngineStatus {
             device_name: self.device_name.clone(),
             capture_format: self.capture_format.clone(),
@@ -449,7 +465,7 @@ impl EngineHandle {
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
-            musicians: join_musicians(&targets, &connected, &counters, &mixes),
+            musicians: join_musicians(&targets, &connected, &counters, &mixes, &names),
         }
     }
 
@@ -655,11 +671,11 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         events.clone(),
     );
     let discovery_thread = spawn_discovery_thread(
-        &targets,
+        Arc::clone(&target_registry),
         config.control_port,
         TARGET_SAMPLE_RATE,
         Arc::clone(&stopped),
-    )?;
+    );
     let (packet_sender, packet_receiver) = sync_channel(CHANNEL_CAPACITY);
     let packet_stats = Arc::new(PacketStats {
         sent: AtomicU64::new(0),
@@ -762,12 +778,16 @@ mod tests {
             },
         );
 
-        let musicians = join_musicians(&targets, &connected, &counters, &mixes);
+        let mut names = HashMap::new();
+        names.insert(ip("192.168.1.4"), "Ana".to_owned());
+
+        let musicians = join_musicians(&targets, &connected, &counters, &mixes, &names);
 
         assert_eq!(musicians.len(), 3);
 
         let connected_with_mix = &musicians[0];
         assert_eq!(connected_with_mix.address, targets[0]);
+        assert_eq!(connected_with_mix.name, None);
         assert!(connected_with_mix.control_connected);
         assert_eq!(connected_with_mix.mix.volume_percent, 42);
         assert_eq!(
@@ -780,6 +800,7 @@ mod tests {
 
         let disconnected = &musicians[1];
         assert_eq!(disconnected.address, targets[1]);
+        assert_eq!(disconnected.name.as_deref(), Some("Ana"));
         assert!(!disconnected.control_connected);
         assert_eq!(disconnected.mix, MixValues::default());
         assert_eq!(
@@ -792,6 +813,7 @@ mod tests {
 
         let connected_without_data = &musicians[2];
         assert_eq!(connected_without_data.address, targets[2]);
+        assert_eq!(connected_without_data.name, None);
         assert!(connected_without_data.control_connected);
         assert_eq!(connected_without_data.counters, MusicianCounters::default());
         assert_eq!(connected_without_data.mix, MixValues::default());

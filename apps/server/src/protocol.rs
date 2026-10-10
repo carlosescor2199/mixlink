@@ -74,6 +74,67 @@ pub(crate) fn parse_mix_command(json: &str, current: MixValues) -> Result<MixVal
     })
 }
 
+/// The longest musician name the server keeps from a registration.
+///
+/// A longer name is truncated rather than rejected: a musician who types too much must still get
+/// audio, and the cap keeps one client from dictating an unbounded string to every UI.
+pub(crate) const MAX_MUSICIAN_NAME_LENGTH: usize = 64;
+
+/// A `register` control message: the musician's name and the UDP port the client listens on.
+///
+/// There is deliberately no address field. The server takes the address from the socket, so a
+/// client cannot claim to be someone else's address even if it includes one in the message.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RegisterCommand {
+    #[serde(rename = "type")]
+    pub(crate) message_type: String,
+    pub(crate) name: String,
+    pub(crate) udp_port: u16,
+}
+
+/// Parses a `register` control message. Errors name what is wrong so a client (or a person
+/// debugging with a socket) can tell why the registration was not accepted.
+pub(crate) fn parse_register_command(json: &str) -> Result<RegisterCommand, String> {
+    let command: RegisterCommand = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    if command.message_type != "register" {
+        return Err(format!(
+            "unsupported control message type: {}",
+            command.message_type
+        ));
+    }
+    if command.udp_port == 0 {
+        return Err("registration requires a UDP port between 1 and 65535".to_owned());
+    }
+    Ok(command)
+}
+
+/// Normalizes the name a client announced: trimmed, capped, and `None` when nothing is left.
+///
+/// Truncating instead of rejecting is deliberate: a musician who types a very long name must still
+/// get audio, and the cap keeps one client from dictating an unbounded string to every UI.
+pub(crate) fn registered_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_MUSICIAN_NAME_LENGTH).collect())
+}
+
+/// The envelope every control message shares: just enough to route it to the right parser.
+#[derive(Deserialize)]
+struct ControlEnvelope {
+    #[serde(rename = "type")]
+    message_type: String,
+}
+
+/// Reads only the `type` of a control message so the connection can route it before committing to
+/// a full parse. Invalid JSON is reported the same way the mix parser would report it.
+pub(crate) fn control_message_type(json: &str) -> Result<String, String> {
+    let envelope: ControlEnvelope =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    Ok(envelope.message_type)
+}
+
 #[derive(Serialize)]
 struct MixAck {
     #[serde(rename = "type")]
@@ -196,6 +257,66 @@ mod tests {
         let ack = mix_ack(values).unwrap();
 
         assert!(ack.contains(r#""group_levels":[80,"#));
+    }
+
+    #[test]
+    fn parses_a_registration_with_the_name_and_udp_port() {
+        let command =
+            parse_register_command(r#"{"type":"register","name":"Ana","udp_port":50000}"#)
+                .expect("a registration should parse");
+
+        assert_eq!(command.name, "Ana");
+        assert_eq!(command.udp_port, 50000);
+    }
+
+    #[test]
+    fn a_registration_without_a_udp_port_is_rejected() {
+        let error = parse_register_command(r#"{"type":"register","name":"Ana"}"#)
+            .expect_err("a registration without a port must be rejected");
+
+        assert!(
+            error.contains("udp_port"),
+            "message names the field: {error}"
+        );
+    }
+
+    #[test]
+    fn a_registration_with_port_zero_is_rejected() {
+        let error = parse_register_command(r#"{"type":"register","name":"Ana","udp_port":0}"#)
+            .expect_err("port zero is not listenable");
+
+        assert!(error.contains("UDP port"), "message explains: {error}");
+    }
+
+    #[test]
+    fn a_message_of_another_type_is_not_a_registration() {
+        let error = parse_register_command(r#"{"type":"mix","name":"Ana","udp_port":50000}"#)
+            .expect_err("a mix is not a registration");
+
+        assert!(error.contains("mix"), "message names the type: {error}");
+    }
+
+    #[test]
+    fn an_address_in_a_registration_is_ignored_because_there_is_no_such_field() {
+        let command = parse_register_command(
+            r#"{"type":"register","name":"Mallory","udp_port":50000,"address":"10.0.0.99:50000","ip":"10.0.0.99"}"#,
+        )
+        .expect("unknown fields must not break the parse");
+
+        assert_eq!(command.name, "Mallory");
+        assert_eq!(command.udp_port, 50000);
+    }
+
+    #[test]
+    fn a_musician_name_is_trimmed_and_capped() {
+        assert_eq!(registered_name("  Ana  ").as_deref(), Some("Ana"));
+        assert_eq!(registered_name("   "), None);
+        assert_eq!(registered_name(""), None);
+
+        let long = "a".repeat(MAX_MUSICIAN_NAME_LENGTH + 10);
+        let name = registered_name(&long).expect("a long name still registers");
+
+        assert_eq!(name.chars().count(), MAX_MUSICIAN_NAME_LENGTH);
     }
 
     #[test]

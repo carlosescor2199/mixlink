@@ -317,6 +317,29 @@ body {
 
 /* Editable musician list -------------------------------------------------- */
 
+/* The manual add is deliberately collapsed and quiet: musicians announce themselves, and this
+   path exists for a fixed rack or for debugging, not as how the product is used. */
+.advanced {
+  margin-bottom: 10px;
+}
+
+.advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  user-select: none;
+}
+
+.advanced summary:hover {
+  color: var(--muted);
+}
+
+.advanced[open] summary {
+  margin-bottom: 8px;
+  color: var(--muted);
+}
+
 .add-form {
   display: flex;
   align-items: center;

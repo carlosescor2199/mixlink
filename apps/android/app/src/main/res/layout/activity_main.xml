@@ -16,10 +16,20 @@
             android:textAppearance="@android:style/TextAppearance.Material.Headline" />
 
         <EditText
-            android:id="@+id/hostInput"
+            android:id="@+id/musicianNameInput"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
+            android:hint="Your name"
+            android:inputType="textPersonName"
+            android:maxLength="64"
+            android:singleLine="true" />
+
+        <EditText
+            android:id="@+id/hostInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:hint="Server IP or host"
             android:inputType="textUri"
             android:singleLine="true" />
