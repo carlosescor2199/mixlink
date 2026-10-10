@@ -328,8 +328,8 @@ pub(crate) fn mix_channels(source: &[i16], channels: usize, values: MixValues) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_mix_states;
     use crate::protocol::parse_mix_command;
+    use crate::targets::TargetRegistry;
     use std::net::IpAddr;
 
     #[test]
@@ -338,16 +338,16 @@ mod tests {
             "192.168.1.3:50000".parse().unwrap(),
             "192.168.1.4:50000".parse().unwrap(),
         ];
-        let states = build_mix_states(&targets, &GroupLayout::default()).unwrap();
-        states
-            .get(&"192.168.1.3".parse().unwrap())
+        let registry = TargetRegistry::new(&targets, &GroupLayout::default()).unwrap();
+        registry
+            .mix_state("192.168.1.3".parse().unwrap())
             .unwrap()
             .update(MixValues {
                 volume_percent: 50,
                 ..MixValues::default()
             });
-        states
-            .get(&"192.168.1.4".parse().unwrap())
+        registry
+            .mix_state("192.168.1.4".parse().unwrap())
             .unwrap()
             .update(MixValues::default());
 
@@ -355,16 +355,16 @@ mod tests {
         let first_output = mix_channels(
             &input,
             2,
-            states
-                .get(&"192.168.1.3".parse().unwrap())
+            registry
+                .mix_state("192.168.1.3".parse().unwrap())
                 .unwrap()
                 .snapshot(),
         );
         let second_output = mix_channels(
             &input,
             2,
-            states
-                .get(&"192.168.1.4".parse().unwrap())
+            registry
+                .mix_state("192.168.1.4".parse().unwrap())
                 .unwrap()
                 .snapshot(),
         );
@@ -379,13 +379,13 @@ mod tests {
             "192.168.1.3:50000".parse().unwrap(),
             "192.168.1.4:50000".parse().unwrap(),
         ];
-        let states = build_mix_states(&targets, &GroupLayout::default()).unwrap();
+        let registry = TargetRegistry::new(&targets, &GroupLayout::default()).unwrap();
         let first_ip: IpAddr = "192.168.1.3".parse().unwrap();
         let second_ip: IpAddr = "192.168.1.4".parse().unwrap();
-        let second_state = states.get(&second_ip).unwrap();
+        let second_state = registry.mix_state(second_ip).unwrap();
         let initial_second = second_state.snapshot();
 
-        states.get(&first_ip).unwrap().update(MixValues {
+        registry.mix_state(first_ip).unwrap().update(MixValues {
             volume_percent: 0,
             max_level_percent: 10,
             muted: true,

@@ -76,6 +76,9 @@ pub struct StartSummary {
 #[serde(rename_all = "camelCase")]
 pub struct MusicianDto {
     pub address: String,
+    /// The engineer's label, filled by the command layer from the desktop-only name store. The
+    /// engine knows nothing about it; it is never sent to a client.
+    pub name: Option<String>,
     pub control_connected: bool,
     pub volume_percent: u8,
     pub max_level_percent: u8,
@@ -132,6 +135,7 @@ impl From<&MusicianStatus> for MusicianDto {
     fn from(musician: &MusicianStatus) -> Self {
         Self {
             address: musician.address.to_string(),
+            name: None,
             control_connected: musician.control_connected,
             volume_percent: musician.mix.volume_percent,
             max_level_percent: musician.mix.max_level_percent,
@@ -206,7 +210,7 @@ impl From<&EngineStatus> for EngineStatusDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use personal_monitoring::{CaptureFormat, EngineStatus, GroupStatus};
+    use personal_monitoring::{CaptureFormat, EngineStatus, GroupStatus, MusicianStatus};
 
     fn status_with(groups: Vec<GroupStatus>, channel_levels: Vec<u8>) -> EngineStatus {
         EngineStatus {
@@ -279,6 +283,20 @@ mod tests {
 
         assert!(dto.groups[0].invalid);
         assert_eq!(dto.groups[0].channels, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_musician_has_no_name_until_the_desktop_layer_fills_it() {
+        let musician = MusicianStatus {
+            address: "192.168.1.30:50000".parse().expect("test address"),
+            control_connected: false,
+            mix: Default::default(),
+            counters: Default::default(),
+        };
+
+        let dto = MusicianDto::from(&musician);
+
+        assert_eq!(dto.name, None);
     }
 
     #[test]

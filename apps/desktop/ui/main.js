@@ -2,7 +2,7 @@
 //
 // There is no bundler and no Node toolchain: `window.__TAURI__` is present because tauri.conf.json
 // sets `withGlobalTauri`, and everything below is plain DOM work. The engine is started once with
-// its own defaults, then polled a few times a second so the meters and counters stay alive.
+// no musicians configured, then polled a few times a second so the meters and counters stay alive.
 
 const { invoke } = window.__TAURI__.core;
 const currentWindow = window.__TAURI__.window.getCurrentWindow();
@@ -24,6 +24,9 @@ const els = {
   channelCount: document.getElementById("channel-count"),
   groups: document.getElementById("groups"),
   channels: document.getElementById("channels"),
+  addMusicianForm: document.getElementById("add-musician"),
+  newTarget: document.getElementById("new-target"),
+  musicianError: document.getElementById("musician-error"),
   musicianCount: document.getElementById("musician-count"),
   musicians: document.getElementById("musicians"),
   musiciansEmpty: document.getElementById("musicians-empty"),
@@ -32,6 +35,10 @@ const els = {
 // Channel number -> the DOM nodes whose values change every poll. The strips themselves are built
 // once per channel count so the meter's CSS transition is not restarted on every poll.
 const channelViews = new Map();
+
+// Address -> the DOM nodes of one musician row. Rows are rebuilt only when the set of addresses
+// changes, so an inline rename keeps its focus and the table never flickers on a poll.
+const musicianViews = new Map();
 
 // The device list from the engine, the last status snapshot, and the device the user is being asked
 // to confirm a switch to. Kept in module scope so a poll never loses them.
@@ -234,58 +241,165 @@ function textCell(text, className) {
   return cell;
 }
 
-function mixCell(musician) {
-  const cell = document.createElement("td");
-  const volume = document.createElement("span");
-  volume.className = "mono";
-  volume.textContent = `${musician.volumePercent}%`;
-  const state = document.createElement("span");
-  state.className = musician.muted ? "tag--muted" : "tag--live";
-  state.textContent = musician.muted ? " · muted" : " · live";
-  cell.append(volume, state);
-  return cell;
+function showMusicianError(message) {
+  els.musicianError.textContent = message;
+  els.musicianError.hidden = false;
 }
 
-function controlCell(connected) {
-  const cell = document.createElement("td");
-  const dot = document.createElement("span");
-  dot.className = connected ? "dot dot--on" : "dot";
-  const label = document.createElement("span");
-  label.textContent = connected ? "connected" : "offline";
-  if (!connected) {
-    label.className = "tag";
+function hideMusicianError() {
+  els.musicianError.textContent = "";
+  els.musicianError.hidden = true;
+}
+
+// Builds one musician row. The name input commits on blur (Enter blurs it, Escape reverts first),
+// and the poll never overwrites the input while it has focus.
+function buildMusicianRow(musician) {
+  const row = document.createElement("tr");
+
+  const nameCell = document.createElement("td");
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.className = "name-input";
+  nameInput.placeholder = "unnamed";
+  nameInput.value = musician.name || "";
+  nameInput.dataset.saved = musician.name || "";
+  nameInput.title = "Label this musician; Enter saves, Escape reverts";
+  nameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      nameInput.blur();
+    } else if (event.key === "Escape") {
+      nameInput.value = nameInput.dataset.saved || "";
+      nameInput.blur();
+    }
+  });
+  nameInput.addEventListener("change", async () => {
+    try {
+      await invoke("set_musician_name", {
+        address: musician.address,
+        name: nameInput.value,
+      });
+      nameInput.dataset.saved = nameInput.value.trim();
+      hideMusicianError();
+    } catch (error) {
+      showMusicianError(`could not save the name: ${error}`);
+    }
+  });
+  nameCell.append(nameInput);
+
+  const controlCell = document.createElement("td");
+  const controlDot = document.createElement("span");
+  const controlLabel = document.createElement("span");
+  controlCell.append(controlDot, controlLabel);
+
+  const mixCell = document.createElement("td");
+  const mixVolume = document.createElement("span");
+  mixVolume.className = "mono";
+  const mixState = document.createElement("span");
+  mixCell.append(mixVolume, mixState);
+
+  const sent = textCell("0", "num");
+  const discarded = textCell("0", "num");
+  const loss = textCell("0.00%", "num");
+
+  const actions = document.createElement("td");
+  actions.className = "actions";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "button button--small button--danger";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => removeMusician(musician.address));
+  actions.append(remove);
+
+  row.append(
+    nameCell,
+    textCell(musician.address, "mono"),
+    controlCell,
+    mixCell,
+    sent,
+    discarded,
+    loss,
+    actions,
+  );
+  return { row, nameInput, controlDot, controlLabel, mixVolume, mixState, sent, discarded, loss };
+}
+
+function updateMusicianRow(view, musician) {
+  const total = musician.packetsSent + musician.packetsDiscarded;
+  const loss = total === 0 ? 0 : (musician.packetsDiscarded / total) * 100;
+
+  view.controlDot.className = musician.controlConnected ? "dot dot--on" : "dot";
+  view.controlLabel.textContent = musician.controlConnected ? "connected" : "offline";
+  view.controlLabel.className = musician.controlConnected ? "" : "tag";
+  view.mixVolume.textContent = `${musician.volumePercent}%`;
+  view.mixState.textContent = musician.muted ? " · muted" : " · live";
+  view.mixState.className = musician.muted ? "tag--muted" : "tag--live";
+  view.sent.textContent = formatNumber(musician.packetsSent);
+  view.discarded.textContent = formatNumber(musician.packetsDiscarded);
+  view.loss.textContent = `${loss.toFixed(2)}%`;
+  view.loss.className = loss > 0 ? "num warn" : "num";
+
+  if (document.activeElement !== view.nameInput) {
+    const name = musician.name || "";
+    view.nameInput.value = name;
+    view.nameInput.dataset.saved = name;
   }
-  cell.append(dot, label);
-  return cell;
 }
 
 function renderMusicians(musicians) {
   els.musicianCount.textContent = `${musicians.length} configured`;
 
   if (musicians.length === 0) {
+    musicianViews.clear();
     els.musicians.replaceChildren();
     els.musiciansEmpty.hidden = false;
     return;
   }
   els.musiciansEmpty.hidden = true;
 
-  const rows = document.createDocumentFragment();
-  for (const musician of musicians) {
-    const total = musician.packetsSent + musician.packetsDiscarded;
-    const loss = total === 0 ? 0 : (musician.packetsDiscarded / total) * 100;
-
-    const row = document.createElement("tr");
-    row.append(
-      textCell(musician.address, "mono"),
-      controlCell(musician.controlConnected),
-      mixCell(musician),
-      textCell(formatNumber(musician.packetsSent), "num"),
-      textCell(formatNumber(musician.packetsDiscarded), "num"),
-      textCell(`${loss.toFixed(2)}%`, loss > 0 ? "num warn" : "num"),
-    );
-    rows.append(row);
+  // Rebuild only when the set of addresses changed: a poll must not destroy an input mid-rename.
+  const sameSet =
+    musicianViews.size === musicians.length &&
+    musicians.every((musician) => musicianViews.has(musician.address));
+  if (!sameSet) {
+    musicianViews.clear();
+    const rows = document.createDocumentFragment();
+    for (const musician of musicians) {
+      const view = buildMusicianRow(musician);
+      musicianViews.set(musician.address, view);
+      rows.append(view.row);
+    }
+    els.musicians.replaceChildren(rows);
   }
-  els.musicians.replaceChildren(rows);
+  for (const musician of musicians) {
+    updateMusicianRow(musicianViews.get(musician.address), musician);
+  }
+}
+
+async function addMusician(event) {
+  event.preventDefault();
+  const address = els.newTarget.value.trim();
+  if (address === "") {
+    return;
+  }
+  try {
+    await invoke("add_target", { address });
+    els.newTarget.value = "";
+    hideMusicianError();
+    await refreshStatus();
+  } catch (error) {
+    showMusicianError(String(error));
+  }
+}
+
+async function removeMusician(address) {
+  try {
+    await invoke("remove_target", { address });
+    hideMusicianError();
+    await refreshStatus();
+  } catch (error) {
+    showMusicianError(String(error));
+  }
 }
 
 function applyStatus(status) {
@@ -323,11 +437,12 @@ function startPolling() {
   pollTimer = window.setInterval(refreshStatus, POLL_INTERVAL_MS);
 }
 
-// The window only drives the engine's own defaults in this increment; editing is a later one.
+// The window starts the engine with nobody configured: the musician list is editable at runtime,
+// so the engineer adds real addresses instead of deleting a placeholder localhost target.
 function defaultConfig() {
   return {
     deviceFilter: null,
-    targets: ["127.0.0.1:50000"],
+    targets: [],
     controlPort: 50001,
     groups: [],
   };
@@ -365,6 +480,7 @@ async function stopEngine() {
     }
     lastStatus = null;
     hideDeviceWarning();
+    hideMusicianError();
     els.deviceSelect.disabled = true;
     setEngineState("stopped", "idle");
   } catch (error) {
@@ -384,6 +500,7 @@ els.deviceCancel.addEventListener("click", () => {
   hideDeviceWarning();
   renderDeviceOptions();
 });
+els.addMusicianForm.addEventListener("submit", addMusician);
 
 loadDevices();
 startEngine();

@@ -12,8 +12,9 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::capture::TARGET_SAMPLE_RATE;
 use crate::engine::{EngineEvent, EventBus};
-use crate::mix::{GroupLayout, MixState};
+use crate::mix::GroupLayout;
 use crate::protocol::{control_error, mix_ack, parse_mix_command, ControlConfig, GroupConfig};
+use crate::targets::TargetRegistry;
 
 /// Counts the live control connections per client IP.
 ///
@@ -74,7 +75,7 @@ fn config_message(source_channels: u8, groups: &GroupLayout) -> Result<String, s
 
 pub(crate) fn spawn_control_thread(
     control_port: u16,
-    mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
+    targets: Arc<TargetRegistry>,
     stopped: Arc<AtomicBool>,
     config_state: Arc<ConfigState>,
     groups: Arc<GroupLayout>,
@@ -105,7 +106,7 @@ pub(crate) fn spawn_control_thread(
         };
         runtime.block_on(run_control_server(
             listener,
-            mix_states,
+            targets,
             stopped,
             config_state,
             groups,
@@ -117,7 +118,7 @@ pub(crate) fn spawn_control_thread(
 
 async fn run_control_server(
     listener: std::net::TcpListener,
-    mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
+    targets: Arc<TargetRegistry>,
     stopped: Arc<AtomicBool>,
     config_state: Arc<ConfigState>,
     groups: Arc<GroupLayout>,
@@ -143,7 +144,7 @@ async fn run_control_server(
             None => continue,
             Some(accepted) => match accepted {
                 Ok((stream, peer)) => {
-                    let states = Arc::clone(&mix_states);
+                    let targets = Arc::clone(&targets);
                     let config_state = Arc::clone(&config_state);
                     let groups = Arc::clone(&groups);
                     let peers = Arc::clone(&peers);
@@ -152,7 +153,7 @@ async fn run_control_server(
                         if let Err(error) = handle_control_connection(
                             stream,
                             peer,
-                            states,
+                            targets,
                             config_state,
                             groups,
                             peers,
@@ -220,7 +221,7 @@ fn register_peer(peers: &ControlPeers, events: &EventBus, address: SocketAddr) -
 async fn handle_control_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
+    targets: Arc<TargetRegistry>,
     config_state: Arc<ConfigState>,
     groups: Arc<GroupLayout>,
     peers: ControlPeers,
@@ -291,7 +292,10 @@ async fn handle_control_connection(
         let message = message?;
         match message {
             Message::Text(text) => {
-                let response = match mix_states.get(&peer.ip()) {
+                // The join is live: a peer whose target was removed at runtime finds no mix state
+                // here and gets the same error an IP that was never configured has always received.
+                // The control channel itself is deliberately left open.
+                let response = match targets.mix_state(peer.ip()) {
                     None => control_error("no UDP target configured for client IP".to_owned())?,
                     Some(mix_state) => match parse_mix_command(&text, mix_state.snapshot()) {
                         Ok(values) => {
@@ -385,6 +389,30 @@ mod tests {
         None
     }
 
+    /// Reads until a message of `kind` arrives, returning its parsed body. Bounded by a deadline so
+    /// a missing answer fails the test instead of hanging it.
+    async fn read_message_of_type(
+        client: &mut ClientStream,
+        kind: &str,
+    ) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, client.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if value.get("type").and_then(|kind| kind.as_str()) == Some(kind) {
+                            return Some(value);
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Exercises the re-send over a real socket, without audio hardware: a client that connected
     /// with two channels learns about four on the same connection.
     ///
@@ -406,7 +434,10 @@ mod tests {
                 .expect("control runtime should build");
             runtime.block_on(run_control_server(
                 listener,
-                Arc::new(HashMap::new()),
+                Arc::new(
+                    TargetRegistry::new(&[], &GroupLayout::default())
+                        .expect("registry should build"),
+                ),
                 server_stopped,
                 server_config,
                 Arc::new(drums()),
@@ -450,6 +481,114 @@ mod tests {
         stopped.store(true, Ordering::SeqCst);
         // The accept loop re-checks `stopped` on the next accept, so nudge it with one connection so
         // the server thread can exit deterministically.
+        let _ = std::net::TcpStream::connect(address);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || server.join()),
+        )
+        .await;
+    }
+
+    /// The removal semantics, exercised over a real socket: removing a target stops its audio but
+    /// does NOT close its control channel. The next `mix` gets the existing no-target error, and the
+    /// connection stays open for the one after it; adding the address back joins the peer again.
+    #[tokio::test]
+    async fn a_removed_targets_control_peer_keeps_its_channel_and_gets_the_no_udp_target_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+        let address = listener.local_addr().expect("listener address");
+        let stopped = Arc::new(AtomicBool::new(false));
+        // The client connects from 127.0.0.1, so this target's IP is the one its control messages
+        // join against.
+        let targets = Arc::new(
+            TargetRegistry::new(
+                &["127.0.0.1:50000".parse().expect("target address")],
+                &GroupLayout::default(),
+            )
+            .expect("registry should build"),
+        );
+
+        let server_stopped = Arc::clone(&stopped);
+        let server_targets = Arc::clone(&targets);
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("control runtime should build");
+            runtime.block_on(run_control_server(
+                listener,
+                server_targets,
+                server_stopped,
+                Arc::new(ConfigState::new(2)),
+                Arc::new(drums()),
+                Arc::new(Mutex::new(HashMap::new())),
+                EventBus::default(),
+            ));
+        });
+
+        let (mut client, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_async(format!("ws://{address}")),
+        )
+        .await
+        .expect("client should connect within 5s")
+        .expect("client should connect");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), read_source_channels(&mut client))
+                .await
+                .expect("config should arrive"),
+            Some(2)
+        );
+
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        assert!(
+            read_message_of_type(&mut client, "mix_ack").await.is_some(),
+            "a configured target's peer should be acknowledged"
+        );
+
+        targets
+            .remove("127.0.0.1:50000")
+            .expect("configured target should be removed");
+
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        let error = read_message_of_type(&mut client, "error")
+            .await
+            .expect("the removed peer should get an error");
+        assert_eq!(
+            error.get("message").and_then(|message| message.as_str()),
+            Some("no UDP target configured for client IP")
+        );
+
+        // The channel was not closed: a second message on the same socket gets the same answer.
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        assert!(
+            read_message_of_type(&mut client, "error").await.is_some(),
+            "the control channel should still be open after the removal"
+        );
+
+        // Adding the address back joins the peer again, with no reconnect.
+        targets
+            .add("127.0.0.1:50000", &GroupLayout::default())
+            .expect("fresh address should be accepted");
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        assert!(
+            read_message_of_type(&mut client, "mix_ack").await.is_some(),
+            "a re-added target should be acknowledged on the same socket"
+        );
+
+        stopped.store(true, Ordering::SeqCst);
         let _ = std::net::TcpStream::connect(address);
         let _ = tokio::time::timeout(
             Duration::from_secs(5),

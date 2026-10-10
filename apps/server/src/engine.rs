@@ -8,7 +8,6 @@ use std::thread::JoinHandle;
 
 use cpal::traits::{HostTrait, StreamTrait};
 
-use crate::build_mix_states;
 use crate::capture::{
     build_input_stream, select_device, select_device_by_name, select_input_config,
     TARGET_SAMPLE_RATE,
@@ -16,9 +15,10 @@ use crate::capture::{
 use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
 use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
-use crate::mix::{Group, GroupLayout, MixState, MixValues, MAX_MIX_CHANNELS};
-use crate::network::{spawn_network_thread, PacketStats, TargetCounters};
+use crate::mix::{Group, GroupLayout, MixValues, MAX_MIX_CHANNELS};
+use crate::network::{spawn_network_thread, PacketStats};
 use crate::protocol::AudioPacket;
+use crate::targets::TargetRegistry;
 
 const CHANNEL_CAPACITY: usize = 8;
 
@@ -361,15 +361,18 @@ pub struct EngineHandle {
     group_definitions: Vec<GroupDefinition>,
     groups: Vec<GroupStatus>,
     levels: Arc<LevelMeter>,
-    targets: Vec<SocketAddr>,
+    /// The live routing table, shared with the network and control threads so targets can be added
+    /// and removed while both keep running.
+    targets: Arc<TargetRegistry>,
+    /// The group layout the last committed device switch produced, used to give a newly added
+    /// target the same channel-to-group membership the existing mix states carry.
+    current_layout: GroupLayout,
     stopped: Arc<AtomicBool>,
     samples_seen: Arc<AtomicU64>,
     /// The packet sequence shared with whichever capture stream is currently running, so a switch
     /// continues the numbering instead of restarting it.
     sequence: Arc<AtomicU64>,
     packet_stats: Arc<PacketStats>,
-    mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
-    target_counters: Arc<HashMap<IpAddr, TargetCounters>>,
     peers: ControlPeers,
     config_state: Arc<ConfigState>,
     events: EventBus,
@@ -416,23 +419,23 @@ impl EngineHandle {
             .keys()
             .copied()
             .collect();
-        let counters: HashMap<IpAddr, MusicianCounters> = self
-            .target_counters
+        let entries = self.targets.read();
+        let targets: Vec<SocketAddr> = entries.iter().map(|entry| entry.address).collect();
+        let counters: HashMap<IpAddr, MusicianCounters> = entries
             .iter()
-            .map(|(ip, counter)| {
+            .map(|entry| {
                 (
-                    *ip,
+                    entry.address.ip(),
                     MusicianCounters {
-                        packets_sent: counter.sent.load(Ordering::Relaxed),
-                        packets_discarded: counter.discarded.load(Ordering::Relaxed),
+                        packets_sent: entry.counters.sent.load(Ordering::Relaxed),
+                        packets_discarded: entry.counters.discarded.load(Ordering::Relaxed),
                     },
                 )
             })
             .collect();
-        let mixes: HashMap<IpAddr, MixValues> = self
-            .mix_states
+        let mixes: HashMap<IpAddr, MixValues> = entries
             .iter()
-            .map(|(ip, state)| (*ip, state.snapshot()))
+            .map(|entry| (entry.address.ip(), entry.mix_state.snapshot()))
             .collect();
         EngineStatus {
             device_name: self.device_name.clone(),
@@ -446,7 +449,7 @@ impl EngineHandle {
             samples_received: self.samples_seen.load(Ordering::Relaxed),
             packets_sent: self.packet_stats.sent.load(Ordering::Relaxed),
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
-            musicians: join_musicians(&self.targets, &connected, &counters, &mixes),
+            musicians: join_musicians(&targets, &connected, &counters, &mixes),
         }
     }
 
@@ -508,13 +511,54 @@ impl EngineHandle {
         };
         self.source_channels = plan.source_channels;
         self.groups = plan.groups;
-        for mix_state in self.mix_states.values() {
-            mix_state.set_group_layout(&plan.mixer_layout);
+        for entry in self.targets.read().iter() {
+            entry.mix_state.set_group_layout(&plan.mixer_layout);
         }
+        self.current_layout = plan.mixer_layout;
         if plan.resend_config {
             self.config_state.set_channels(plan.source_channels);
         }
         Ok(self.capture_format.clone())
+    }
+
+    /// Adds a UDP target while the engine runs.
+    ///
+    /// The value is resolved and validated before anything changes; a value that cannot be resolved,
+    /// or whose IP is already configured, is rejected with an error naming the value and the table
+    /// is left exactly as it was. On success the target joins the live routing table with a neutral
+    /// mix carrying the current group layout and zero counters, and the next packet is sent to it.
+    /// The capture stream, the UDP network thread, the control server and the discovery beacon all
+    /// keep running, exactly as they do across a device switch.
+    pub fn add_target(&self, value: &str) -> Result<SocketAddr, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        self.targets
+            .add(value, &self.current_layout)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
+    }
+
+    /// Removes a UDP target while the engine runs.
+    ///
+    /// ## What happens to the removed musician
+    ///
+    /// - Their audio stops immediately: the address leaves the routing table, so the next packet is
+    ///   sent to the remaining targets only. The bound is one packet interval, tens of milliseconds
+    ///   at 48 kHz packaging, not a restart or a timeout.
+    /// - Their control channel is **not** forcibly closed. The connection stays open and the next
+    ///   `mix` message is answered with the existing `no UDP target configured for client IP`
+    ///   error, which the Android client already surfaces. Nothing is silently dropped and no new
+    ///   protocol message is introduced: the address is simply no longer in the routing table,
+    ///   which is the same answer an unknown IP has always received.
+    /// - No other target is disturbed: every other entry keeps its mix state, its counters and its
+    ///   stream, and the control server, the discovery beacon and the capture stream keep running.
+    pub fn remove_target(&self, value: &str) -> Result<SocketAddr, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        self.targets
+            .remove(value)
+            .map_err(|error| -> Box<dyn Error> { error.into() })
     }
 
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
@@ -539,15 +583,6 @@ impl EngineHandle {
         }
         Ok(())
     }
-}
-
-fn build_target_counters(targets: &[SocketAddr]) -> Arc<HashMap<IpAddr, TargetCounters>> {
-    Arc::new(
-        targets
-            .iter()
-            .map(|target| (target.ip(), TargetCounters::default()))
-            .collect(),
-    )
 }
 
 /// Starts the engine and returns its handle, or `None` when no input device is available.
@@ -605,15 +640,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         &config.groups,
         usize::from(source_channels),
     )?);
-    let mix_states = build_mix_states(&targets, &group_layout)?;
-    let target_counters = build_target_counters(&targets);
+    let target_registry = Arc::new(TargetRegistry::new(&targets, &group_layout)?);
     let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
     let config_state = Arc::new(ConfigState::new(source_channels));
     let events = EventBus::default();
 
     let control_thread = spawn_control_thread(
         config.control_port,
-        Arc::clone(&mix_states),
+        Arc::clone(&target_registry),
         Arc::clone(&stopped),
         Arc::clone(&config_state),
         Arc::clone(&group_layout),
@@ -633,10 +667,8 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     });
     let network_thread = spawn_network_thread(
         packet_receiver,
-        targets.clone(),
-        Arc::clone(&mix_states),
+        Arc::clone(&target_registry),
         Arc::clone(&packet_stats),
-        Arc::clone(&target_counters),
     )?;
     let samples_seen = Arc::new(AtomicU64::new(0));
     let levels = Arc::new(LevelMeter::new());
@@ -669,13 +701,12 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         group_definitions: config.groups,
         groups: group_statuses(&group_layout),
         levels,
-        targets,
+        targets: target_registry,
+        current_layout: (*group_layout).clone(),
         stopped,
         samples_seen,
         sequence,
         packet_stats,
-        mix_states,
-        target_counters,
         peers,
         config_state,
         events,

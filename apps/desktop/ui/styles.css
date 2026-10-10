@@ -315,6 +315,81 @@ body {
   color: var(--muted);
 }
 
+/* Editable musician list -------------------------------------------------- */
+
+.add-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.input {
+  font: inherit;
+  font-size: 13px;
+  width: 260px;
+  padding: 6px 10px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+}
+
+.form-error {
+  color: var(--red);
+  font-size: 12px;
+}
+
+.form-error[hidden] {
+  display: none;
+}
+
+.name-input {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  padding: 3px 6px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.name-input::placeholder {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.name-input:hover {
+  border-color: var(--border-strong);
+}
+
+.name-input:focus {
+  outline: none;
+  background: var(--surface-2);
+  border-color: var(--accent-dim);
+}
+
+.button--small {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.musicians td.actions {
+  text-align: right;
+}
+
 /* Musicians table --------------------------------------------------------- */
 
 .table-wrap {
@@ -328,24 +403,32 @@ body {
   font-size: 13px;
 }
 
+.musicians .col-name {
+  width: 17%;
+}
+
 .musicians .col-address {
-  width: 30%;
+  width: 23%;
 }
 
 .musicians .col-control {
-  width: 16%;
+  width: 11%;
 }
 
 .musicians .col-mix {
-  width: 16%;
+  width: 12%;
 }
 
 .musicians .col-count {
-  width: 13%;
+  width: 10%;
 }
 
 .musicians .col-loss {
-  width: 12%;
+  width: 9%;
+}
+
+.musicians .col-actions {
+  width: 8%;
 }
 
 .musicians td {

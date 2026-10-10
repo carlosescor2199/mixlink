@@ -78,30 +78,53 @@
           Musicians
           <span id="musician-count" class="panel-note">0 configured</span>
         </h2>
+        <form id="add-musician" class="add-form">
+          <input
+            id="new-target"
+            class="input mono"
+            type="text"
+            placeholder="192.168.1.50:50000"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="New musician address"
+          />
+          <button type="submit" class="button">Add musician</button>
+          <span id="musician-error" class="form-error" hidden></span>
+        </form>
+        <p class="hint">
+          Adding or removing a musician never restarts the server: the capture stream, the control
+          server and the discovery beacon keep running. Removing stops that musician's audio
+          immediately; their control channel stays open and their next mix is answered with
+          "no UDP target configured for client IP". Names are labels for this desk only.
+        </p>
         <div class="table-wrap">
           <table class="musicians">
             <colgroup>
+              <col class="col-name" />
               <col class="col-address" />
               <col class="col-control" />
               <col class="col-mix" />
               <col class="col-count" />
               <col class="col-count" />
               <col class="col-loss" />
+              <col class="col-actions" />
             </colgroup>
             <thead>
               <tr>
+                <th>Name</th>
                 <th>Address</th>
                 <th>Control</th>
                 <th>Mix</th>
                 <th class="num">Sent</th>
                 <th class="num">Discarded</th>
                 <th class="num">Loss</th>
+                <th></th>
               </tr>
             </thead>
             <tbody id="musicians"></tbody>
           </table>
         </div>
-        <p id="musicians-empty" class="empty">No musicians configured.</p>
+        <p id="musicians-empty" class="empty">No musicians configured. Add one by address above.</p>
       </section>
     </main>
 

@@ -11,26 +11,39 @@ use personal_monitoring::{start, EngineConfig, EngineHandle, GroupDefinition};
 use crate::dto::{
     CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, StartRequest, StartSummary,
 };
+use crate::names::MusicianNames;
 
-/// The engine handle the commands share, or `None` when the engine is not running.
+/// The state the desktop commands share: the running engine, and the desktop-only name store.
 ///
-/// A [Mutex] is enough because the engine is already internally concurrent: the commands only need
-/// exclusive access to start, stop and take a snapshot.
-pub type EngineState = Mutex<Option<EngineHandle>>;
+/// The engine handle is behind a [Mutex] because the engine is already internally concurrent: the
+/// commands only need exclusive access to start, stop and take a snapshot. The name store has its
+/// own lock, and the two are never held in the opposite order, so they cannot deadlock.
+pub struct DesktopState {
+    engine: Mutex<Option<EngineHandle>>,
+    names: MusicianNames,
+}
 
-const DEFAULT_TARGET: &str = "127.0.0.1:50000";
+impl DesktopState {
+    pub fn new(names: MusicianNames) -> Self {
+        Self {
+            engine: Mutex::new(None),
+            names,
+        }
+    }
+}
+
 const DEFAULT_CONTROL_PORT: u16 = 50001;
 
 /// Translates the webview's request into the engine's own configuration.
+///
+/// An empty target list stays empty: the musician list is editable at runtime now, so the window
+/// starts with nobody configured and the engineer adds musicians by address. The old implicit
+/// `127.0.0.1:50000` target played into the void on the engineer's own machine and made the first
+/// step of a real session "remove the placeholder".
 fn to_engine_config(request: StartRequest) -> EngineConfig {
-    let targets = if request.targets.is_empty() {
-        vec![DEFAULT_TARGET.to_owned()]
-    } else {
-        request.targets
-    };
     EngineConfig {
         device_filter: request.device_filter,
-        targets,
+        targets: request.targets,
         control_port: request.control_port.unwrap_or(DEFAULT_CONTROL_PORT),
         groups: request
             .groups
@@ -46,9 +59,10 @@ fn to_engine_config(request: StartRequest) -> EngineConfig {
 /// Starts the engine and returns the device and capture format the window shows.
 ///
 /// Starting while one is already running replaces it rather than stacking a second capture stream.
-pub fn start_engine(state: &EngineState, request: StartRequest) -> Result<StartSummary, String> {
+pub fn start_engine(state: &DesktopState, request: StartRequest) -> Result<StartSummary, String> {
     let config = to_engine_config(request);
     let mut guard = state
+        .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
 
@@ -78,20 +92,85 @@ pub fn start_engine(state: &EngineState, request: StartRequest) -> Result<StartS
     }
 }
 
-/// Returns the engine's current status, or an error when it is not running.
-pub fn engine_status(state: &EngineState) -> Result<EngineStatusDto, String> {
+/// Returns the engine's current status, with each musician row labelled from the name store.
+pub fn engine_status(state: &DesktopState) -> Result<EngineStatusDto, String> {
     let guard = state
+        .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
     let handle = guard
         .as_ref()
         .ok_or_else(|| "the engine is not running".to_owned())?;
-    Ok(EngineStatusDto::from(&handle.status()))
+    let mut status = EngineStatusDto::from(&handle.status());
+    apply_names(&mut status, &state.names);
+    Ok(status)
+}
+
+/// Fills each musician row's label from the desktop-only store, joining on the address string.
+///
+/// Kept separate from [EngineStatusDto] so the DTO stays a pure translation of engine state and
+/// the desktop-only concern is applied in one place.
+fn apply_names(status: &mut EngineStatusDto, names: &MusicianNames) {
+    for musician in &mut status.musicians {
+        musician.name = names.get(&musician.address);
+    }
+}
+
+/// Adds a musician by address while the engine runs, returning the resolved address.
+///
+/// A duplicate IP or an unresolvable address is rejected by the engine with an error naming the
+/// value, and nothing changes. On success the next audio packet is sent to the new address; the
+/// other musicians, the control server and the discovery beacon are untouched.
+pub fn add_target(state: &DesktopState, address: String) -> Result<String, String> {
+    let guard = state
+        .engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let handle = guard
+        .as_ref()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    let added = handle
+        .add_target(&address)
+        .map_err(|error| error.to_string())?;
+    println!("[mixlink-desktop] add_target: {added}");
+    Ok(added.to_string())
+}
+
+/// Removes a musician by address while the engine runs, returning the removed address.
+///
+/// The engine's documented removal semantics apply: their audio stops on the next packet, their
+/// control channel stays open and their next `mix` is answered with the existing
+/// `no UDP target configured for client IP` error, and no other musician is disturbed.
+pub fn remove_target(state: &DesktopState, address: String) -> Result<String, String> {
+    let guard = state
+        .engine
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let handle = guard
+        .as_ref()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    let removed = handle
+        .remove_target(&address)
+        .map_err(|error| error.to_string())?;
+    println!("[mixlink-desktop] remove_target: {removed}");
+    Ok(removed.to_string())
+}
+
+/// Sets or clears a musician's label. The label never reaches the engine or any client.
+pub fn set_musician_name(
+    state: &DesktopState,
+    address: String,
+    name: String,
+) -> Result<(), String> {
+    state.names.set(&address, &name)?;
+    println!("[mixlink-desktop] set_musician_name: {address} -> \"{name}\"");
+    Ok(())
 }
 
 /// Stops the engine and joins its threads. Stopping when idle is a no-op.
-pub fn stop_engine(state: &EngineState) -> Result<(), String> {
+pub fn stop_engine(state: &DesktopState) -> Result<(), String> {
     let mut guard = state
+        .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
     match guard.take() {
@@ -110,8 +189,9 @@ pub fn list_input_devices() -> Result<Vec<InputDeviceDto>, String> {
 
 /// Switches a running engine to another input device, keeping the network, control and discovery
 /// threads alive. A failed switch returns the error and leaves the previous device running.
-pub fn switch_device(state: &EngineState, device: String) -> Result<StartSummary, String> {
+pub fn switch_device(state: &DesktopState, device: String) -> Result<StartSummary, String> {
     let mut guard = state
+        .engine
         .lock()
         .map_err(|_| "engine state lock was poisoned".to_owned())?;
     let handle = guard
@@ -130,4 +210,74 @@ pub fn switch_device(state: &EngineState, device: String) -> Result<StartSummary
         device_name: handle.device_name().to_owned(),
         capture_format: format,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dto::MusicianDto;
+
+    fn status_with_musicians(addresses: &[&str]) -> EngineStatusDto {
+        EngineStatusDto {
+            device_name: "Test device".to_owned(),
+            capture_format: CaptureFormatDto {
+                channels: 2,
+                sample_rate: 48_000,
+                sample_format: "I16".to_owned(),
+                buffer_size: "Default".to_owned(),
+            },
+            control_port: DEFAULT_CONTROL_PORT,
+            sample_rate: 48_000,
+            source_channels: 2,
+            groups: Vec::new(),
+            channels: Vec::new(),
+            stopped: false,
+            samples_received: 0,
+            packets_sent: 0,
+            packets_discarded: 0,
+            musicians: addresses
+                .iter()
+                .map(|address| MusicianDto {
+                    address: (*address).to_owned(),
+                    name: None,
+                    control_connected: false,
+                    volume_percent: 100,
+                    max_level_percent: 100,
+                    muted: false,
+                    packets_sent: 0,
+                    packets_discarded: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn names_path(test: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir()
+            .join("mixlink-command-tests")
+            .join(test);
+        let _ = std::fs::remove_dir_all(&directory);
+        directory.join("musicians.json")
+    }
+
+    #[test]
+    fn status_rows_take_their_labels_from_the_name_store() {
+        let names = MusicianNames::load(names_path("labels"));
+        names
+            .set("192.168.1.30:50000", "Ana")
+            .expect("setting a name should persist");
+        let mut status = status_with_musicians(&["192.168.1.30:50000", "192.168.1.31:50000"]);
+
+        apply_names(&mut status, &names);
+
+        assert_eq!(status.musicians[0].name.as_deref(), Some("Ana"));
+        assert_eq!(status.musicians[1].name, None);
+    }
+
+    #[test]
+    fn an_empty_target_list_stays_empty_so_the_window_starts_with_nobody_configured() {
+        let config = to_engine_config(StartRequest::default());
+
+        assert!(config.targets.is_empty());
+        assert_eq!(config.control_port, DEFAULT_CONTROL_PORT);
+    }
 }
