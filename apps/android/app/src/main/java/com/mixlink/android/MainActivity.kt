@@ -102,8 +102,9 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
 
         bankStore = MixBankStore(this)
         musicianChannel = bankStore.musicianChannel()
-        // The name is remembered the same way the musician channel is: restored here, saved as it
-        // is typed, and sent with the registration when the control channel opens.
+        // The name is remembered the same way the musician channel is: restored here and saved as
+        // it is typed. It travels in the registration when the control channel opens, and a change
+        // re-announces it on the open channel, so the label stays live while the audio keeps going.
         musicianNameInput.setText(bankStore.musicianName())
         musicianNameInput.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -111,7 +112,9 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
 
             override fun afterTextChanged(s: Editable?) {
-                bankStore.setMusicianName(s?.toString() ?: "")
+                val name = s?.toString() ?: ""
+                bankStore.setMusicianName(name)
+                control.updateRegistrationName(name)
             }
         })
         saveBankButton.setOnClickListener { saveCurrentBank() }
@@ -199,7 +202,8 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         running.set(true)
         startButton.isEnabled = false
         stopButton.isEnabled = true
-        musicianNameInput.isEnabled = false
+        // Only the fields that genuinely need a restart are locked: the name is a label and stays
+        // editable while streaming, re-announcing itself on the open control channel.
         hostInput.isEnabled = false
         portInput.isEnabled = false
         controlPortInput.isEnabled = false
@@ -221,7 +225,6 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         statusText.text = "Status: Stopping"
         startButton.isEnabled = true
         stopButton.isEnabled = false
-        musicianNameInput.isEnabled = true
         hostInput.isEnabled = true
         portInput.isEnabled = true
         controlPortInput.isEnabled = true
@@ -459,7 +462,6 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
         runOnUiThread {
             startButton.isEnabled = true
             stopButton.isEnabled = false
-            musicianNameInput.isEnabled = true
             hostInput.isEnabled = true
             portInput.isEnabled = true
             controlPortInput.isEnabled = true

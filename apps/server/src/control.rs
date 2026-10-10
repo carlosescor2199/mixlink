@@ -797,6 +797,184 @@ mod tests {
         stop_server(address, &stopped, server).await;
     }
 
+    /// The rename path over real sockets, the exact sequence the Android client performs: register
+    /// with one name, stream audio, then re-register with a different name on the same open socket
+    /// and the same UDP port. The target keeps its mix state and the phone keeps receiving audio.
+    ///
+    /// The server already replaces the stored name on a re-registration (it rebuilds the origin, so
+    /// the name cannot go stale while the grace period is only cancelled). This test pins that
+    /// behaviour at the socket level, where the Android client actually meets it.
+    #[tokio::test]
+    async fn a_re_registration_updates_the_reported_name_while_the_audio_keeps_flowing() {
+        let targets =
+            Arc::new(TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry"));
+        let (address, stopped, server) = start_registration_server(Arc::clone(&targets));
+
+        // The "phone": its port is what the registration announces, and where its audio must land.
+        let phone = std::net::UdpSocket::bind("127.0.0.1:0").expect("phone socket");
+        let phone_port = phone.local_addr().expect("phone address").port();
+        let target_ip: IpAddr = "127.0.0.1".parse().expect("target IP");
+
+        let (mut client, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_async(format!("ws://{address}")),
+        )
+        .await
+        .expect("client should connect within 5s")
+        .expect("client should connect");
+        assert!(
+            read_message_of_type(&mut client, "config").await.is_some(),
+            "config should arrive"
+        );
+
+        client
+            .send(Message::Text(
+                format!(r#"{{"type":"register","name":"Ana","udp_port":{phone_port}}}"#).into(),
+            ))
+            .await
+            .expect("client should send");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !targets
+            .read()
+            .iter()
+            .any(|entry| entry.address.ip() == target_ip)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the registration should create a target"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mix_before = targets.mix_state(target_ip).expect("registered target");
+        println!(
+            "before rename: name={:?}",
+            registered_name(&targets, target_ip)
+        );
+
+        // The same UDP send thread the engine runs: one packet in, one packet at the phone.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let network = crate::network::spawn_network_thread(
+            receiver,
+            Arc::clone(&targets),
+            Arc::new(crate::network::PacketStats {
+                sent: std::sync::atomic::AtomicU64::new(0),
+                discarded: std::sync::atomic::AtomicU64::new(0),
+            }),
+        )
+        .expect("network thread should spawn");
+        sender
+            .send(crate::protocol::AudioPacket {
+                channels: 2,
+                sample_rate: 48_000,
+                sequence: 0,
+                samples: vec![0, 0],
+            })
+            .expect("packet should queue");
+        let (phone, first_length) = receive_one_packet(phone).await;
+        println!(
+            "audio before rename: {} bytes at the phone",
+            first_length.expect("the phone should receive audio before the rename")
+        );
+
+        // The rename: the same open WebSocket sends a second registration with the same UDP port.
+        client
+            .send(Message::Text(
+                format!(r#"{{"type":"register","name":"Bea","udp_port":{phone_port}}}"#).into(),
+            ))
+            .await
+            .expect("client should send");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while registered_name(&targets, target_ip).as_deref() != Some("Bea") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the re-registration should replace the stored name"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        println!(
+            "after rename: name={:?}",
+            registered_name(&targets, target_ip)
+        );
+
+        // The rename changed nothing but the label: same target, same mix allocation, same port.
+        let entries = targets.read();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].address,
+            format!("127.0.0.1:{phone_port}")
+                .parse()
+                .expect("target address")
+        );
+        drop(entries);
+        assert!(Arc::ptr_eq(
+            &mix_before,
+            &targets.mix_state(target_ip).expect("kept target")
+        ));
+
+        // The audio keeps flowing to the same socket, with no reconnect anywhere in between.
+        sender
+            .send(crate::protocol::AudioPacket {
+                channels: 2,
+                sample_rate: 48_000,
+                sequence: 1,
+                samples: vec![0, 0],
+            })
+            .expect("packet should queue");
+        let (_phone, second_length) = receive_one_packet(phone).await;
+        println!(
+            "audio after rename: {} bytes at the phone",
+            second_length.expect("the phone should receive audio after the rename")
+        );
+
+        // The control channel is still the same live socket: its mix is acknowledged after the rename.
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+        assert!(
+            read_message_of_type(&mut client, "mix_ack").await.is_some(),
+            "the renamed peer should still be acknowledged on the same socket"
+        );
+
+        client.close(None).await.expect("the client should close");
+        drop(client);
+        drop(sender);
+        network.join().expect("network thread should exit");
+        stop_server(address, &stopped, server).await;
+    }
+
+    /// The stored name for an IP, read straight from the registry the engine's status is built from.
+    fn registered_name(targets: &TargetRegistry, ip: IpAddr) -> Option<String> {
+        targets
+            .read()
+            .iter()
+            .find(|entry| entry.address.ip() == ip)
+            .and_then(|entry| entry.origin.name().map(str::to_owned))
+    }
+
+    /// Blocks on the phone socket until one datagram arrives, returning the socket and its length so
+    /// the caller can keep listening. Bounded by a read timeout so a missing packet fails the test.
+    async fn receive_one_packet(
+        phone: std::net::UdpSocket,
+    ) -> (std::net::UdpSocket, Option<usize>) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                phone
+                    .set_read_timeout(Some(Duration::from_secs(4)))
+                    .expect("phone read timeout should be set");
+                let mut buffer = [0u8; 4096];
+                let length = phone.recv(&mut buffer).ok();
+                (phone, length)
+            }),
+        )
+        .await
+        .expect("audio should arrive within 5s")
+        .expect("recv task should finish")
+    }
+
     /// The grace period over a real socket: dropping the control channel keeps the target, and the
     /// drop is what arms its eventual removal. The exact boundary is covered by the pure tests in
     /// `targets`; this proves the wiring between the connection guard and the sweep.

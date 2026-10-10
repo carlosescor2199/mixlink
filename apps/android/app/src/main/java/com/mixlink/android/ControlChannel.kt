@@ -8,7 +8,19 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * How long the channel waits after the last keystroke before re-announcing a new name.
+ *
+ * Normal typing pauses between keystrokes are around 100-250 ms, well under this, so a name typed
+ * at speed becomes one registration message per pause instead of one per key. It stays short
+ * enough that the desktop, which polls the engine every 250 ms, shows the new name within about
+ * half a second of the musician finishing the word.
+ */
+private const val NAME_RESEND_DEBOUNCE_MS = 400L
 
 /**
  * The OkHttp WebSocket control channel, its connection state machine, sending and closing.
@@ -32,11 +44,13 @@ internal class ControlChannel(
         fun onControlError(message: String)
     }
 
-    private val controlExecutor = Executors.newSingleThreadExecutor()
+    private val controlExecutor = Executors.newSingleThreadScheduledExecutor()
     private val httpClient = OkHttpClient()
 
     @Volatile private var controlWebSocket: WebSocket? = null
     @Volatile private var registrationMessage: String? = null
+    @Volatile private var announcedUdpPort: Int? = null
+    private var pendingNameResend: ScheduledFuture<*>? = null
     @Volatile var controlState = ControlState.IDLE
     @Volatile var mixAcknowledged = false
         private set
@@ -93,6 +107,7 @@ internal class ControlChannel(
      * answers with an error or ignores it, and the rest of the session behaves as before.
      */
     fun connect(host: String, port: Int, udpPort: Int, musicianName: String) {
+        announcedUdpPort = udpPort
         registrationMessage = buildRegisterMessage(musicianName, udpPort)
         controlExecutor.execute {
             try {
@@ -107,16 +122,42 @@ internal class ControlChannel(
     }
 
     /**
+     * Re-announces the client under a new name on the open control channel. The name is a label,
+     * not part of the audio: no reconnect happens and no receiver is restarted, and the server
+     * updates the target it already has, keeping its mix state and counters.
+     *
+     * Sends are debounced by [NAME_RESEND_DEBOUNCE_MS] so typing produces one message per pause,
+     * not one per keystroke. The stored registration is updated too, so a socket that has not
+     * opened yet announces the latest name when it does.
+     */
+    fun updateRegistrationName(name: String) {
+        if (!running.get()) return
+        val udpPort = announcedUdpPort ?: return
+        val message = buildRegisterMessage(name, udpPort)
+        registrationMessage = message
+        pendingNameResend?.cancel(false)
+        pendingNameResend = controlExecutor.schedule(
+            { sendRegistrationMessage(message) },
+            NAME_RESEND_DEBOUNCE_MS,
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    /**
      * Sends the registration once, on open, ahead of the first mix. Queued on the same executor as
      * the mix sends, so the server always sees the registration first.
      */
     private fun sendRegistration() {
         val message = registrationMessage ?: return
         controlExecutor.execute {
-            val webSocket = controlWebSocket ?: return@execute
-            if (!webSocket.send(message) && running.get()) {
-                listener.onControlError("WebSocket rejected the registration")
-            }
+            sendRegistrationMessage(message)
+        }
+    }
+
+    private fun sendRegistrationMessage(message: String) {
+        val webSocket = controlWebSocket ?: return
+        if (!webSocket.send(message) && running.get()) {
+            listener.onControlError("WebSocket rejected the registration")
         }
     }
 

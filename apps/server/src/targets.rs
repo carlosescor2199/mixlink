@@ -550,6 +550,45 @@ mod tests {
     }
 
     #[test]
+    fn re_registration_with_a_new_name_updates_it_and_keeps_the_target_and_its_mix() {
+        let registry = TargetRegistry::new(&[], &GroupLayout::default()).expect("empty registry");
+        registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Ana".to_owned()),
+            &GroupLayout::default(),
+        );
+        let mix = registry
+            .mix_state(ip("192.168.1.50"))
+            .expect("registered target");
+        // A live mix the musician set before renaming: the re-registration must not rebuild it.
+        mix.update(crate::mix::MixValues {
+            volume_percent: 42,
+            ..Default::default()
+        });
+
+        // The musician edits their name while streaming: same socket, same UDP port, new name.
+        let updated = registry.register(
+            ip("192.168.1.50"),
+            50000,
+            Some("Bea".to_owned()),
+            &GroupLayout::default(),
+        );
+
+        assert_eq!(updated, address("192.168.1.50:50000"));
+        assert_eq!(
+            registered_name(&registry, ip("192.168.1.50")).as_deref(),
+            Some("Bea"),
+            "a re-registration must replace the stored name"
+        );
+        assert!(Arc::ptr_eq(
+            &mix,
+            &registry.mix_state(ip("192.168.1.50")).expect("kept target")
+        ));
+        assert_eq!(mix.snapshot().volume_percent, 42);
+    }
+
+    #[test]
     fn a_configured_target_is_never_removed_by_the_grace_period() {
         let registry =
             TargetRegistry::new(&[address("192.168.1.50:50000")], &GroupLayout::default())
