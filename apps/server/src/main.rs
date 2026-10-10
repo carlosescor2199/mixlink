@@ -82,6 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&group_layout),
     );
     let discovery_thread = spawn_discovery_thread(
+        &targets,
         arguments.control_port,
         TARGET_SAMPLE_RATE,
         Arc::clone(&stopped),
