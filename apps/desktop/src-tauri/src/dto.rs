@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use personal_monitoring::{CaptureFormat, EngineStatus, MusicianStatus};
+use personal_monitoring::{CaptureFormat, EngineStatus, InputDevice, MusicianStatus};
 
 /// The start-up configuration the webview sends to [crate::commands::start_engine].
 ///
@@ -90,6 +90,28 @@ pub struct MusicianDto {
 pub struct GroupDto {
     pub name: String,
     pub channels: Vec<usize>,
+    /// True when the current input device is missing a channel this group names. The group is still
+    /// shown and kept; the window uses this to mark it and to warn before a further switch.
+    pub invalid: bool,
+}
+
+/// One selectable input device: its name and the channel count a switch would capture.
+///
+/// `channels` of `0` means the device has no supported PCM input, so it is listed but not usable.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDeviceDto {
+    pub name: String,
+    pub channels: u16,
+}
+
+impl From<&InputDevice> for InputDeviceDto {
+    fn from(device: &InputDevice) -> Self {
+        Self {
+            name: device.name.clone(),
+            channels: device.channels,
+        }
+    }
 }
 
 /// One source channel as the window shows it: a 1-based number, its group when the engineer
@@ -146,6 +168,7 @@ impl From<&EngineStatus> for EngineStatusDto {
             .map(|group| GroupDto {
                 name: group.name.clone(),
                 channels: group.channels.clone(),
+                invalid: group.invalid,
             })
             .collect();
         // The engine publishes the group layout once; the per-channel membership the window needs
@@ -153,10 +176,12 @@ impl From<&EngineStatus> for EngineStatusDto {
         let channels = (0..usize::from(status.source_channels))
             .map(|index| ChannelDto {
                 number: (index + 1) as u8,
+                // An invalid group is shown in the group list but does not own any channel, because
+                // the mixer ignores it; labelling a channel with it would overstate what is applied.
                 group: status
                     .groups
                     .iter()
-                    .find(|group| group.channels.contains(&index))
+                    .find(|group| !group.invalid && group.channels.contains(&index))
                     .map(|group| group.name.clone()),
                 level: status.channel_levels.get(index).copied().unwrap_or(0),
             })
@@ -211,6 +236,7 @@ mod tests {
             vec![GroupStatus {
                 name: "Drums".to_owned(),
                 channels: vec![0],
+                invalid: false,
             }],
             vec![50, 100],
         );
@@ -236,5 +262,52 @@ mod tests {
 
         assert!(dto.channels.iter().all(|channel| channel.group.is_none()));
         assert!(dto.groups.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_group_is_flagged_for_the_window_and_keeps_its_channels() {
+        let status = status_with(
+            vec![GroupStatus {
+                name: "Vocals".to_owned(),
+                channels: vec![2, 3],
+                invalid: true,
+            }],
+            vec![0, 0],
+        );
+
+        let dto = EngineStatusDto::from(&status);
+
+        assert!(dto.groups[0].invalid);
+        assert_eq!(dto.groups[0].channels, vec![2, 3]);
+    }
+
+    #[test]
+    fn input_device_reports_its_name_and_channel_count() {
+        let device = InputDevice {
+            name: "Interface".to_owned(),
+            channels: 6,
+        };
+
+        let dto = InputDeviceDto::from(&device);
+
+        assert_eq!(dto.name, "Interface");
+        assert_eq!(dto.channels, 6);
+    }
+
+    #[test]
+    fn a_channel_of_an_invalid_group_is_not_labelled_with_it() {
+        let status = status_with(
+            vec![GroupStatus {
+                name: "Drums".to_owned(),
+                channels: vec![0, 1],
+                invalid: true,
+            }],
+            vec![0, 0],
+        );
+
+        let dto = EngineStatusDto::from(&status);
+
+        assert_eq!(dto.channels[0].group, None);
+        assert!(dto.groups[0].invalid);
     }
 }

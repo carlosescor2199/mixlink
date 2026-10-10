@@ -8,7 +8,9 @@ use std::sync::Mutex;
 
 use personal_monitoring::{start, EngineConfig, EngineHandle, GroupDefinition};
 
-use crate::dto::{EngineStatusDto, GroupRequest, StartRequest, StartSummary};
+use crate::dto::{
+    CaptureFormatDto, EngineStatusDto, GroupRequest, InputDeviceDto, StartRequest, StartSummary,
+};
 
 /// The engine handle the commands share, or `None` when the engine is not running.
 ///
@@ -96,4 +98,36 @@ pub fn stop_engine(state: &EngineState) -> Result<(), String> {
         Some(mut handle) => handle.stop().map_err(|error| error.to_string()),
         None => Ok(()),
     }
+}
+
+/// Lists the input devices the window can switch to, each with the channel count a switch would
+/// capture. Independent of the engine, so the window can populate the selector before starting.
+pub fn list_input_devices() -> Result<Vec<InputDeviceDto>, String> {
+    personal_monitoring::list_input_devices()
+        .map(|devices| devices.iter().map(InputDeviceDto::from).collect())
+        .map_err(|error| error.to_string())
+}
+
+/// Switches a running engine to another input device, keeping the network, control and discovery
+/// threads alive. A failed switch returns the error and leaves the previous device running.
+pub fn switch_device(state: &EngineState, device: String) -> Result<StartSummary, String> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "engine state lock was poisoned".to_owned())?;
+    let handle = guard
+        .as_mut()
+        .ok_or_else(|| "the engine is not running".to_owned())?;
+    handle
+        .switch_device(Some(&device))
+        .map_err(|error| error.to_string())?;
+    let format = CaptureFormatDto::from(handle.capture_format());
+    println!(
+        "[mixlink-desktop] switch_device: device=\"{}\" capture_format={}",
+        handle.device_name(),
+        format.describe()
+    );
+    Ok(StartSummary {
+        device_name: handle.device_name().to_owned(),
+        capture_format: format,
+    })
 }

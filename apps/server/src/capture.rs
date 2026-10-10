@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 
-use cpal::traits::DeviceTrait;
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{
     Device, InputCallbackInfo, SampleFormat, Stream, SupportedStreamConfig,
     SupportedStreamConfigRange,
@@ -15,6 +15,58 @@ use crate::protocol::AudioPacket;
 
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 48_000;
 const MAX_SAMPLES_PER_PACKET: usize = u16::MAX as usize;
+
+/// One selectable input device and the channel count the engine would capture from it.
+///
+/// `channels` is the count of the configuration [select_input_config] would choose, not the raw
+/// maximum the hardware advertises, so it is exactly what a switch would change the session to.
+/// A device with no supported PCM input reports `0` and is listed but not usable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputDevice {
+    pub name: String,
+    pub channels: u16,
+}
+
+/// Enumerates the host's input devices with the channel count a switch would capture.
+pub fn list_input_devices() -> Result<Vec<InputDevice>, Box<dyn Error>> {
+    let host = cpal::default_host();
+    let devices = host
+        .input_devices()
+        .map_err(|error| format!("could not enumerate input devices: {error}"))?;
+    Ok(devices
+        .map(|device| {
+            describe_input_device(
+                device.to_string(),
+                select_input_config(&device).map(|config| config.channels()),
+            )
+        })
+        .collect())
+}
+
+/// Joins a device name with its configuration selection into a reportable [InputDevice].
+///
+/// Kept pure and separate from enumeration so the channel-count reporting is testable without an
+/// audio host; an unsupported device carries `0` channels rather than being hidden.
+fn describe_input_device(name: String, config: Result<u16, Box<dyn Error>>) -> InputDevice {
+    InputDevice {
+        name,
+        channels: config.unwrap_or(0),
+    }
+}
+
+/// Selects the input device whose reported name equals `name`, exactly.
+///
+/// Device names overlap (a bare interface name is a prefix of the one with a port suffix), so a
+/// switch that came from a device list must match the whole name rather than a substring.
+pub(crate) fn select_device_by_name(
+    devices: Vec<Device>,
+    name: &str,
+) -> Result<Device, Box<dyn Error>> {
+    devices
+        .into_iter()
+        .find(|device| device.to_string() == name)
+        .ok_or_else(|| format!("input device \"{name}\" is no longer available").into())
+}
 
 pub(crate) fn select_device(
     devices: Vec<Device>,
@@ -121,12 +173,12 @@ pub(crate) fn build_input_stream(
     samples_seen: Arc<AtomicU64>,
     packet_stats: Arc<PacketStats>,
     levels: Arc<LevelMeter>,
+    sequence: Arc<AtomicU64>,
 ) -> Result<Stream, Box<dyn Error>> {
     let config = supported_config.config();
     let channels = config.channels as u8;
     let sample_rate = config.sample_rate;
     let decimator = Decimator::new(sample_rate, channels)?;
-    let sequence = Arc::new(AtomicU64::new(0));
     let error_callback = |error| eprintln!("Audio input error: {error}");
 
     let stream = match supported_config.sample_format() {
@@ -302,6 +354,7 @@ fn u16_to_i16(sample: u16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::sync_channel;
 
     #[test]
     fn converts_supported_sample_formats_to_pcm16() {
@@ -366,5 +419,60 @@ mod tests {
         let error = sample_rate_reduction_ratio(44_100).unwrap_err();
 
         assert!(error.contains("cannot be reduced exactly"));
+    }
+
+    #[test]
+    fn describe_input_device_reports_the_selected_channel_count() {
+        assert_eq!(
+            describe_input_device("Interface".to_owned(), Ok(4)),
+            InputDevice {
+                name: "Interface".to_owned(),
+                channels: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_supported_input_reports_zero_channels() {
+        let error: Box<dyn Error> = "no supported PCM input".into();
+
+        let device = describe_input_device("Broken".to_owned(), Err(error));
+
+        assert_eq!(device.channels, 0);
+        assert_eq!(device.name, "Broken");
+    }
+
+    #[test]
+    fn reusing_the_sequence_counter_continues_it_across_stream_rebuilds() {
+        let (sender, receiver) = sync_channel(4);
+        let stats = PacketStats {
+            sent: AtomicU64::new(0),
+            discarded: AtomicU64::new(0),
+        };
+        let sequence = Arc::new(AtomicU64::new(0));
+        let samples_seen = AtomicU64::new(0);
+        let levels = LevelMeter::new();
+
+        enqueue_packet(
+            &sender,
+            &stats,
+            &sequence,
+            vec![0, 0],
+            2,
+            &samples_seen,
+            &levels,
+        );
+        enqueue_packet(
+            &sender,
+            &stats,
+            &sequence,
+            vec![0, 0],
+            2,
+            &samples_seen,
+            &levels,
+        );
+
+        assert_eq!(receiver.recv().unwrap().sequence, 0);
+        assert_eq!(receiver.recv().unwrap().sequence, 1);
     }
 }

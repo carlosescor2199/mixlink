@@ -23,9 +23,18 @@
       <section class="panel panel--input">
         <h2 class="panel-title">Input</h2>
         <div class="readouts">
-          <div class="readout">
-            <span class="readout-label">Device</span>
-            <span id="device" class="readout-value">—</span>
+          <div class="readout readout--device">
+            <label class="readout-label" for="device-select">Input device</label>
+            <select id="device-select" class="select" disabled>
+              <option value="">starting…</option>
+            </select>
+            <div id="device-warning" class="warning" hidden>
+              <span id="device-warning-text"></span>
+              <span class="warning-actions">
+                <button id="device-switch-anyway" type="button" class="button">Switch anyway</button>
+                <button id="device-cancel" type="button" class="button">Cancel</button>
+              </span>
+            </div>
           </div>
           <div class="readout">
             <span class="readout-label">Capture format</span>
@@ -48,7 +57,10 @@
             <span id="packets" class="readout-value mono">—</span>
           </div>
         </div>
-        <p class="hint">Read-only in this build. Device selection and reconfiguration are a later increment.</p>
+        <p class="hint">
+          Switching device rebuilds only the capture stream: the control channel and the discovery
+          beacon stay up, and packet numbering continues.
+        </p>
       </section>
 
       <section class="panel panel--channels">
@@ -56,6 +68,7 @@
           Sources
           <span id="channel-count" class="panel-note">0 channels</span>
         </h2>
+        <div id="groups" class="groups" hidden></div>
         <p class="hint">Labelled by number and group; per-channel names are not configured in this build.</p>
         <div id="channels" class="strips"></div>
       </section>

@@ -28,7 +28,7 @@ pub(crate) type Arguments = EngineConfig;
 ///
 /// The conversion to the protocol's 0-based indices needs the captured channel count, so it happens
 /// in [validate_groups] once the input device has been selected.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupDefinition {
     pub name: String,
     pub channels: Vec<usize>,

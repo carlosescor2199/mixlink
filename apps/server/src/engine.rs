@@ -9,11 +9,14 @@ use std::thread::JoinHandle;
 use cpal::traits::{HostTrait, StreamTrait};
 
 use crate::build_mix_states;
-use crate::capture::{build_input_stream, select_device, select_input_config, TARGET_SAMPLE_RATE};
-use crate::cli::{resolve_targets, validate_groups, EngineConfig};
-use crate::control::{spawn_control_thread, ControlPeers};
+use crate::capture::{
+    build_input_stream, select_device, select_device_by_name, select_input_config,
+    TARGET_SAMPLE_RATE,
+};
+use crate::cli::{resolve_targets, validate_groups, EngineConfig, GroupDefinition};
+use crate::control::{spawn_control_thread, ConfigState, ControlPeers};
 use crate::discovery::spawn_discovery_thread;
-use crate::mix::{GroupLayout, MixState, MixValues, MAX_MIX_CHANNELS};
+use crate::mix::{Group, GroupLayout, MixState, MixValues, MAX_MIX_CHANNELS};
 use crate::network::{spawn_network_thread, PacketStats, TargetCounters};
 use crate::protocol::AudioPacket;
 
@@ -67,13 +70,16 @@ pub struct MusicianStatus {
 /// One configured group of source channels, as the observation API exposes it.
 ///
 /// Channels are 0-based source indices, the same numbering the protocol's `config` message and the
-/// mixer use, and membership is fixed at startup. The engine publishes the layout once rather than
-/// a per-channel lookup so there is a single authoritative source of membership; a consumer derives
-/// "which group is channel N in" by reading this list.
+/// mixer use. Membership is fixed at startup and is never rewritten by a device switch; instead
+/// [Self::invalid] reports when the current device no longer has one of the channels the group names,
+/// so a UI can warn without the engineer's configuration being destroyed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupStatus {
     pub name: String,
     pub channels: Vec<usize>,
+    /// True when the current capture device is missing a channel this group names. An invalid group
+    /// is reported and kept, but is excluded from the mixer so it cannot affect audio.
+    pub invalid: bool,
 }
 
 /// A snapshot of everything the engine can report without blocking the audio path.
@@ -236,6 +242,8 @@ impl LevelMeter {
 }
 
 /// Snapshots the fixed group layout into the observation-friendly [GroupStatus] list.
+///
+/// Used at startup, where [validate_groups] has already proven every group valid.
 fn group_statuses(layout: &GroupLayout) -> Vec<GroupStatus> {
     layout
         .groups()
@@ -243,8 +251,103 @@ fn group_statuses(layout: &GroupLayout) -> Vec<GroupStatus> {
         .map(|group| GroupStatus {
             name: group.name.clone(),
             channels: group.channels.clone(),
+            invalid: false,
         })
         .collect()
+}
+
+/// The result of re-checking the engineer's groups against a channel count.
+///
+/// `statuses` preserves the groups for reporting, with invalidity flagged. `mixer_layout` is the
+/// membership the mixer may act on: an invalid group contributes no channels, so it cannot affect
+/// audio even though it is neither deleted nor modified.
+pub(crate) struct GroupRevalidation {
+    pub(crate) statuses: Vec<GroupStatus>,
+    pub(crate) mixer_layout: GroupLayout,
+}
+
+/// Re-checks the engineer's fixed groups against a channel count without failing or mutating them.
+///
+/// Unlike [validate_groups], which rejects an out-of-range group at startup, this is the lenient
+/// post-switch check: a channel the new device does not have marks the whole group invalid but keeps
+/// its definition, so switching back restores it. Definitions are read only.
+pub(crate) fn revalidate_groups(
+    definitions: &[GroupDefinition],
+    channel_count: usize,
+) -> GroupRevalidation {
+    let mut statuses = Vec::with_capacity(definitions.len());
+    let mut mixer_groups = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let invalid = definition
+            .channels
+            .iter()
+            .any(|&channel| channel == 0 || channel > channel_count);
+        let channels: Vec<usize> = definition
+            .channels
+            .iter()
+            .map(|&channel| channel.saturating_sub(1))
+            .collect();
+        statuses.push(GroupStatus {
+            name: definition.name.clone(),
+            channels: channels.clone(),
+            invalid,
+        });
+        // Invalid groups keep their slot in the list so group indices line up with `group_levels`,
+        // but map no channel; the mixer then cannot apply their level to anything.
+        mixer_groups.push(Group {
+            name: definition.name.clone(),
+            channels: if invalid { Vec::new() } else { channels },
+        });
+    }
+    GroupRevalidation {
+        statuses,
+        mixer_layout: GroupLayout::new(mixer_groups),
+    }
+}
+
+/// Everything a successful device switch changes, computed before anything is mutated.
+pub(crate) struct DeviceSwitchPlan {
+    pub(crate) source_channels: u8,
+    pub(crate) groups: Vec<GroupStatus>,
+    pub(crate) mixer_layout: GroupLayout,
+    pub(crate) resend_config: bool,
+}
+
+/// Plans the state change for a capture device that now has `new_channels` channels.
+///
+/// Pure and non-mutating: the previous group definitions are read, the groups are re-validated, and
+/// `resend_config` is set only when the channel count actually changed, which is when connected
+/// clients must rebuild.
+pub(crate) fn plan_device_switch(
+    current_channels: u8,
+    definitions: &[GroupDefinition],
+    new_channels: u8,
+) -> DeviceSwitchPlan {
+    let revalidation = revalidate_groups(definitions, usize::from(new_channels));
+    DeviceSwitchPlan {
+        source_channels: new_channels,
+        groups: revalidation.statuses,
+        mixer_layout: revalidation.mixer_layout,
+        resend_config: new_channels != current_channels,
+    }
+}
+
+/// Turns a fallible capture rebuild into the plan to commit, or leaves the previous state alone.
+///
+/// The rebuild touches real hardware and can fail; keeping the conversion to a plan in a pure
+/// function is what makes the "a failed switch preserves the previous state" rule testable without
+/// an audio device.
+pub(crate) fn plan_switch_from_attempt(
+    current_channels: u8,
+    definitions: &[GroupDefinition],
+    attempt: Result<u16, Box<dyn Error>>,
+) -> Result<DeviceSwitchPlan, Box<dyn Error>> {
+    let new_channels = attempt?.min(u16::from(u8::MAX)) as u8;
+    Ok(plan_device_switch(
+        current_channels,
+        definitions,
+        new_channels,
+    ))
 }
 
 /// The live engine. Dropping it does not stop the engine; call [EngineHandle::stop].
@@ -253,15 +356,22 @@ pub struct EngineHandle {
     capture_format: CaptureFormat,
     control_port: u16,
     source_channels: u8,
+    /// The engineer's groups exactly as configured, kept so a device switch can re-validate them
+    /// against the new channel count without ever rewriting them.
+    group_definitions: Vec<GroupDefinition>,
     groups: Vec<GroupStatus>,
     levels: Arc<LevelMeter>,
     targets: Vec<SocketAddr>,
     stopped: Arc<AtomicBool>,
     samples_seen: Arc<AtomicU64>,
+    /// The packet sequence shared with whichever capture stream is currently running, so a switch
+    /// continues the numbering instead of restarting it.
+    sequence: Arc<AtomicU64>,
     packet_stats: Arc<PacketStats>,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     target_counters: Arc<HashMap<IpAddr, TargetCounters>>,
     peers: ControlPeers,
+    config_state: Arc<ConfigState>,
     events: EventBus,
     stream: Option<cpal::Stream>,
     packet_sender: Option<SyncSender<AudioPacket>>,
@@ -338,6 +448,73 @@ impl EngineHandle {
             packets_discarded: self.packet_stats.discarded.load(Ordering::Relaxed),
             musicians: join_musicians(&self.targets, &connected, &counters, &mixes),
         }
+    }
+
+    /// Switches the input device while the rest of the engine keeps running.
+    ///
+    /// Only the capture stream is rebuilt: the UDP network thread, the control WebSocket server and
+    /// the discovery beacon are untouched, and the packet sequence continues from where it was. The
+    /// new stream is built and started before the old one is dropped, so a device that has vanished
+    /// or a format that cannot be opened leaves the previous capture exactly as it was and returns
+    /// the error. On success, groups are re-validated (never rewritten) and connected clients are
+    /// told to rebuild when the channel count changed.
+    pub fn switch_device(&mut self, filter: Option<&str>) -> Result<CaptureFormat, Box<dyn Error>> {
+        if self.is_stopped() {
+            return Err("the engine is stopping".into());
+        }
+        let device = {
+            let host = cpal::default_host();
+            let devices = host
+                .input_devices()
+                .map_err(|error| format!("could not enumerate input devices: {error}"))?
+                .collect::<Vec<_>>();
+            match filter {
+                Some(name) => select_device_by_name(devices, name)?,
+                None => select_device(devices, None)?,
+            }
+        };
+        let supported_config = select_input_config(&device)?;
+        let packet_sender = self.packet_sender.clone().ok_or("the engine is stopping")?;
+
+        // Build and start the replacement before touching the current capture, so any failure below
+        // is a no-op for the running session.
+        let new_stream = build_input_stream(
+            &device,
+            &supported_config,
+            packet_sender,
+            Arc::clone(&self.samples_seen),
+            Arc::clone(&self.packet_stats),
+            Arc::clone(&self.levels),
+            Arc::clone(&self.sequence),
+        )?;
+        new_stream
+            .play()
+            .map_err(|error| format!("could not start input capture: {error}"))?;
+
+        let plan = plan_switch_from_attempt(
+            self.source_channels,
+            &self.group_definitions,
+            Ok(supported_config.channels()),
+        )?;
+
+        // Commit: the new capture is confirmed working.
+        self.stream = Some(new_stream);
+        self.device_name = device.to_string();
+        self.capture_format = CaptureFormat {
+            channels: supported_config.channels(),
+            sample_rate: supported_config.sample_rate(),
+            sample_format: format!("{:?}", supported_config.sample_format()),
+            buffer_size: format!("{:?}", supported_config.buffer_size()),
+        };
+        self.source_channels = plan.source_channels;
+        self.groups = plan.groups;
+        for mix_state in self.mix_states.values() {
+            mix_state.set_group_layout(&plan.mixer_layout);
+        }
+        if plan.resend_config {
+            self.config_state.set_channels(plan.source_channels);
+        }
+        Ok(self.capture_format.clone())
     }
 
     /// Stops capture and joins the engine threads, the same clean shutdown Ctrl+C triggers.
@@ -431,13 +608,14 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     let mix_states = build_mix_states(&targets, &group_layout)?;
     let target_counters = build_target_counters(&targets);
     let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+    let config_state = Arc::new(ConfigState::new(source_channels));
     let events = EventBus::default();
 
     let control_thread = spawn_control_thread(
         config.control_port,
         Arc::clone(&mix_states),
         Arc::clone(&stopped),
-        source_channels,
+        Arc::clone(&config_state),
         Arc::clone(&group_layout),
         Arc::clone(&peers),
         events.clone(),
@@ -462,6 +640,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
     )?;
     let samples_seen = Arc::new(AtomicU64::new(0));
     let levels = Arc::new(LevelMeter::new());
+    let sequence = Arc::new(AtomicU64::new(0));
     let stream = build_input_stream(
         &device,
         &supported_config,
@@ -469,6 +648,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         Arc::clone(&samples_seen),
         Arc::clone(&packet_stats),
         Arc::clone(&levels),
+        Arc::clone(&sequence),
     )?;
     stream
         .play()
@@ -486,15 +666,18 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
         capture_format,
         control_port: config.control_port,
         source_channels,
+        group_definitions: config.groups,
         groups: group_statuses(&group_layout),
         levels,
         targets,
         stopped,
         samples_seen,
+        sequence,
         packet_stats,
         mix_states,
         target_counters,
         peers,
+        config_state,
         events,
         stream: Some(stream),
         packet_sender: Some(packet_sender),
@@ -507,6 +690,7 @@ pub fn start(config: EngineConfig) -> Result<Option<EngineHandle>, Box<dyn Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::GroupDefinition;
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("test IP should parse")
@@ -637,7 +821,120 @@ mod tests {
             vec![GroupStatus {
                 name: "Drums".to_owned(),
                 channels: vec![0, 1],
+                invalid: false,
             }]
         );
+    }
+
+    #[test]
+    fn revalidating_groups_reports_out_of_range_groups_without_changing_them() {
+        let definitions = vec![
+            GroupDefinition {
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            },
+            GroupDefinition {
+                name: "Vocals".to_owned(),
+                channels: vec![5],
+            },
+        ];
+
+        let revalidation = revalidate_groups(&definitions, 2);
+
+        assert_eq!(revalidation.statuses.len(), 2);
+        assert_eq!(revalidation.statuses[0].name, "Drums");
+        assert_eq!(revalidation.statuses[0].channels, vec![0, 1]);
+        assert!(!revalidation.statuses[0].invalid);
+        assert_eq!(revalidation.statuses[1].name, "Vocals");
+        assert!(revalidation.statuses[1].invalid);
+        // The engineer's definitions are read, never rewritten.
+        assert_eq!(definitions[1].channels, vec![5]);
+    }
+
+    #[test]
+    fn an_invalid_group_is_excluded_from_the_mixer_but_kept_for_reporting() {
+        let definitions = vec![
+            GroupDefinition {
+                name: "Drums".to_owned(),
+                channels: vec![1, 2],
+            },
+            GroupDefinition {
+                name: "Vocals".to_owned(),
+                channels: vec![3, 4],
+            },
+        ];
+
+        // A two-channel device: "Vocals" names channels 3 and 4, so it is invalid.
+        let revalidation = revalidate_groups(&definitions, 2);
+        let mapping = revalidation.mixer_layout.channel_group();
+
+        assert_eq!(mapping[0], Some(0));
+        assert_eq!(mapping[1], Some(0));
+        assert_eq!(mapping[2], None);
+        assert_eq!(mapping[3], None);
+        assert!(revalidation.statuses[1].invalid);
+        assert_eq!(revalidation.statuses[1].channels, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_smaller_device_invalidates_a_group_and_switching_back_restores_it() {
+        let definitions = vec![GroupDefinition {
+            name: "Drums".to_owned(),
+            channels: vec![1, 2, 3, 4],
+        }];
+
+        let smaller = plan_device_switch(4, &definitions, 2);
+        assert_eq!(smaller.source_channels, 2);
+        assert!(smaller.resend_config);
+        assert!(smaller.groups[0].invalid);
+        assert_eq!(smaller.mixer_layout.channel_group()[0], None);
+
+        let restored = plan_device_switch(2, &definitions, 4);
+        assert_eq!(restored.source_channels, 4);
+        assert!(restored.resend_config);
+        assert!(!restored.groups[0].invalid);
+        assert_eq!(restored.mixer_layout.channel_group()[0], Some(0));
+        assert_eq!(restored.mixer_layout.channel_group()[3], Some(0));
+    }
+
+    #[test]
+    fn a_switch_to_the_same_channel_count_does_not_ask_for_a_config_resend() {
+        let definitions = vec![GroupDefinition {
+            name: "Drums".to_owned(),
+            channels: vec![1, 2],
+        }];
+
+        let plan = plan_device_switch(2, &definitions, 2);
+
+        assert!(!plan.resend_config);
+    }
+
+    #[test]
+    fn a_failed_capture_rebuild_yields_no_plan_and_leaves_the_previous_state() {
+        let definitions = vec![GroupDefinition {
+            name: "Drums".to_owned(),
+            channels: vec![1, 2, 3, 4],
+        }];
+        let error: Box<dyn Error> = "input device \"Gone\" is no longer available".into();
+
+        let result = plan_switch_from_attempt(4, &definitions, Err(error));
+
+        assert!(result.is_err());
+        // Nothing was planned or mutated: the previous configuration stands.
+        assert_eq!(definitions[0].channels, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_successful_capture_rebuild_plans_the_new_channels_and_group_validity() {
+        let definitions = vec![GroupDefinition {
+            name: "Drums".to_owned(),
+            channels: vec![1, 2, 3, 4],
+        }];
+
+        let plan = plan_switch_from_attempt(4, &definitions, Ok(2)).expect("plan should build");
+
+        assert_eq!(plan.source_channels, 2);
+        assert!(plan.resend_config);
+        assert!(plan.groups[0].invalid);
     }
 }

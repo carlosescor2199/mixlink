@@ -11,13 +11,18 @@ const POLL_INTERVAL_MS = 250;
 
 const els = {
   engineState: document.getElementById("engine-state"),
-  device: document.getElementById("device"),
+  deviceSelect: document.getElementById("device-select"),
+  deviceWarning: document.getElementById("device-warning"),
+  deviceWarningText: document.getElementById("device-warning-text"),
+  deviceSwitchAnyway: document.getElementById("device-switch-anyway"),
+  deviceCancel: document.getElementById("device-cancel"),
   format: document.getElementById("format"),
   sampleRate: document.getElementById("sample-rate"),
   controlPort: document.getElementById("control-port"),
   samplesReceived: document.getElementById("samples-received"),
   packets: document.getElementById("packets"),
   channelCount: document.getElementById("channel-count"),
+  groups: document.getElementById("groups"),
   channels: document.getElementById("channels"),
   musicianCount: document.getElementById("musician-count"),
   musicians: document.getElementById("musicians"),
@@ -27,6 +32,12 @@ const els = {
 // Channel number -> the DOM nodes whose values change every poll. The strips themselves are built
 // once per channel count so the meter's CSS transition is not restarted on every poll.
 const channelViews = new Map();
+
+// The device list from the engine, the last status snapshot, and the device the user is being asked
+// to confirm a switch to. Kept in module scope so a poll never loses them.
+let inputDevices = [];
+let lastStatus = null;
+let pendingDeviceName = null;
 
 let pollTimer = null;
 
@@ -88,6 +99,129 @@ function renderChannels(channels) {
     const view = channelViews.get(channel.number);
     view.fill.style.height = `${channel.level}%`;
     view.level.textContent = String(channel.level);
+  }
+}
+
+function renderGroups(groups) {
+  if (groups.length === 0) {
+    els.groups.hidden = true;
+    els.groups.replaceChildren();
+    return;
+  }
+  els.groups.hidden = false;
+  const fragment = document.createDocumentFragment();
+  for (const group of groups) {
+    const chip = document.createElement("span");
+    chip.className = group.invalid ? "chip chip--invalid" : "chip";
+    const channels = group.channels.map((channel) => channel + 1).join(", ");
+    chip.textContent = group.invalid
+      ? `${group.name} — unavailable on this device`
+      : group.name;
+    chip.title = `Channels ${channels}`;
+    fragment.append(chip);
+  }
+  els.groups.replaceChildren(fragment);
+}
+
+function renderDeviceOptions() {
+  els.deviceSelect.replaceChildren();
+  if (inputDevices.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "no input devices";
+    els.deviceSelect.append(option);
+    els.deviceSelect.disabled = true;
+    return;
+  }
+  for (const device of inputDevices) {
+    const option = document.createElement("option");
+    option.value = device.name;
+    option.textContent = `${device.name} — ${device.channels} ${
+      device.channels === 1 ? "channel" : "channels"
+    }`;
+    option.disabled = device.channels === 0;
+    els.deviceSelect.append(option);
+  }
+  syncDeviceSelection();
+}
+
+function syncDeviceSelection() {
+  if (inputDevices.length === 0) {
+    els.deviceSelect.disabled = true;
+    return;
+  }
+  els.deviceSelect.disabled = lastStatus === null || lastStatus.stopped;
+  if (lastStatus) {
+    els.deviceSelect.value = lastStatus.deviceName;
+  }
+}
+
+async function loadDevices() {
+  try {
+    inputDevices = await invoke("list_input_devices");
+  } catch (error) {
+    inputDevices = [];
+    console.warn("could not list input devices", error);
+  }
+  renderDeviceOptions();
+}
+
+// The names of the groups the engine would mark invalid if the input had `channelCount` channels.
+// Groups carry 0-based channels, so a channel is missing when it is at or beyond the new count.
+function invalidGroupsFor(channelCount) {
+  if (!lastStatus) {
+    return [];
+  }
+  return lastStatus.groups
+    .filter((group) => group.channels.some((channel) => channel >= channelCount))
+    .map((group) => group.name);
+}
+
+function hideDeviceWarning() {
+  pendingDeviceName = null;
+  els.deviceWarning.hidden = true;
+}
+
+function requestDeviceSwitch(name) {
+  if (!name || (lastStatus && name === lastStatus.deviceName)) {
+    hideDeviceWarning();
+    renderDeviceOptions();
+    return;
+  }
+  const device = inputDevices.find((candidate) => candidate.name === name);
+  if (!device) {
+    return;
+  }
+  const invalid = invalidGroupsFor(device.channels);
+  if (invalid.length > 0) {
+    pendingDeviceName = name;
+    const noun = invalid.length === 1 ? "group" : "groups";
+    els.deviceWarningText.textContent =
+      `Switching to ${device.name} (${device.channels} ch) makes ${invalid.length} ${noun} ` +
+      `unavailable: ${invalid.join(", ")}. They are kept, not deleted, and become available again ` +
+      `if you switch back.`;
+    els.deviceWarning.hidden = false;
+    renderDeviceOptions();
+    return;
+  }
+  performDeviceSwitch(name);
+}
+
+async function performDeviceSwitch(name) {
+  hideDeviceWarning();
+  els.deviceSelect.disabled = true;
+  try {
+    const summary = await invoke("switch_device", { device: name });
+    els.format.textContent = describeFormat(summary.captureFormat);
+    try {
+      await currentWindow.setTitle(`MixLink Server — ${summary.deviceName}`);
+    } catch (error) {
+      console.warn("could not update the window title", error);
+    }
+    await refreshStatus();
+  } catch (error) {
+    setEngineState(`switch failed: ${error}`, "error");
+    await refreshStatus();
   }
 }
 
@@ -155,8 +289,8 @@ function renderMusicians(musicians) {
 }
 
 function applyStatus(status) {
+  lastStatus = status;
   setEngineState(status.stopped ? "stopped" : "running", status.stopped ? "idle" : "on");
-  els.device.textContent = status.deviceName;
   els.format.textContent = describeFormat(status.captureFormat);
   els.sampleRate.textContent = `${formatNumber(status.sampleRate)} Hz`;
   els.controlPort.textContent = String(status.controlPort);
@@ -166,7 +300,9 @@ function applyStatus(status) {
     status.sourceChannels === 1 ? "channel" : "channels"
   }`;
   renderChannels(status.channels);
+  renderGroups(status.groups);
   renderMusicians(status.musicians);
+  syncDeviceSelection();
 }
 
 async function refreshStatus() {
@@ -201,7 +337,6 @@ async function startEngine() {
   setEngineState("starting", "idle");
   try {
     const summary = await invoke("start_engine", { config: defaultConfig() });
-    els.device.textContent = summary.deviceName;
     els.format.textContent = describeFormat(summary.captureFormat);
     setEngineState("running", "on");
 
@@ -214,9 +349,9 @@ async function startEngine() {
     }
 
     startPolling();
+    await loadDevices();
   } catch (error) {
     setEngineState(`error: ${error}`, "error");
-    els.device.textContent = "—";
     els.format.textContent = "—";
   }
 }
@@ -228,6 +363,9 @@ async function stopEngine() {
       window.clearInterval(pollTimer);
       pollTimer = null;
     }
+    lastStatus = null;
+    hideDeviceWarning();
+    els.deviceSelect.disabled = true;
     setEngineState("stopped", "idle");
   } catch (error) {
     setEngineState(`error: ${error}`, "error");
@@ -236,5 +374,16 @@ async function stopEngine() {
 
 document.getElementById("refresh").addEventListener("click", refreshStatus);
 document.getElementById("stop").addEventListener("click", stopEngine);
+els.deviceSelect.addEventListener("change", () => requestDeviceSwitch(els.deviceSelect.value));
+els.deviceSwitchAnyway.addEventListener("click", () => {
+  if (pendingDeviceName) {
+    performDeviceSwitch(pendingDeviceName);
+  }
+});
+els.deviceCancel.addEventListener("click", () => {
+  hideDeviceWarning();
+  renderDeviceOptions();
+});
 
+loadDevices();
 startEngine();

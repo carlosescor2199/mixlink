@@ -4,6 +4,9 @@ pub(crate) const MAX_MIX_CHANNELS: usize = 32;
 pub(crate) const MAX_GROUPS: usize = 16;
 pub(crate) const OUTPUT_CHANNELS: u8 = 2;
 
+/// The sentinel stored for a channel that belongs to no group, or to an invalid one.
+const NO_GROUP: u8 = u8::MAX;
+
 /// A named group of source channels, with 0-based indices as the protocol and the mixer use them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Group {
@@ -53,7 +56,9 @@ pub(crate) struct MixState {
     channel_muted: [AtomicBool; MAX_MIX_CHANNELS],
     channel_solo: [AtomicBool; MAX_MIX_CHANNELS],
     group_levels: [AtomicU8; MAX_GROUPS],
-    channel_group: [Option<usize>; MAX_MIX_CHANNELS],
+    /// Channel-to-group membership, one atomic slot per channel so a device switch can replace the
+    /// mapping while the network thread keeps reading it lock-free. `NO_GROUP` means no group.
+    channel_group: [AtomicU8; MAX_MIX_CHANNELS],
     volume_percent: AtomicU8,
     max_level_percent: AtomicU8,
     muted: AtomicBool,
@@ -94,7 +99,7 @@ impl Default for MixState {
             channel_muted: std::array::from_fn(|_| AtomicBool::new(false)),
             channel_solo: std::array::from_fn(|_| AtomicBool::new(false)),
             group_levels: std::array::from_fn(|_| AtomicU8::new(100)),
-            channel_group: [None; MAX_MIX_CHANNELS],
+            channel_group: std::array::from_fn(|_| AtomicU8::new(NO_GROUP)),
             volume_percent: AtomicU8::new(100),
             max_level_percent: AtomicU8::new(100),
             muted: AtomicBool::new(false),
@@ -134,9 +139,26 @@ impl MixState {
     /// Builds a state that carries the server's fixed group membership. Each client's group levels
     /// start neutral, so a client that never sends `group_levels` hears every channel ungrouped.
     pub(crate) fn new(layout: &GroupLayout) -> Self {
-        Self {
-            channel_group: layout.channel_group(),
-            ..Self::default()
+        let state = Self::default();
+        state.set_group_layout(layout);
+        state
+    }
+
+    /// Replaces the channel-to-group membership the mixer reads, leaving the client's stored group
+    /// levels untouched.
+    ///
+    /// A device switch changes which channels exist, so a group can become invalid. An invalid group
+    /// maps no channel and therefore cannot affect audio, while its level is preserved for the
+    /// switch back. The update is lock-free: the network thread only ever loads complete slots.
+    pub(crate) fn set_group_layout(&self, layout: &GroupLayout) {
+        for (slot, group) in self.channel_group.iter().zip(layout.channel_group().iter()) {
+            slot.store(
+                match group {
+                    Some(index) => *index as u8,
+                    None => NO_GROUP,
+                },
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -168,7 +190,12 @@ impl MixState {
             group_levels: std::array::from_fn(|index| {
                 self.group_levels[index].load(Ordering::Relaxed)
             }),
-            channel_group: self.channel_group,
+            channel_group: std::array::from_fn(|index| {
+                match self.channel_group[index].load(Ordering::Relaxed) {
+                    NO_GROUP => None,
+                    group => Some(usize::from(group)),
+                }
+            }),
             volume_percent: self.volume_percent.load(Ordering::Relaxed),
             max_level_percent: self.max_level_percent.load(Ordering::Relaxed),
             muted: self.muted.load(Ordering::Relaxed),
@@ -727,5 +754,36 @@ mod tests {
 
         assert_eq!(values.channel_group[0], Some(0));
         assert_eq!(values.group_levels[0], 50);
+    }
+
+    #[test]
+    fn replacing_the_group_layout_stops_an_invalid_group_from_affecting_audio() {
+        let layout = GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![0],
+        }]);
+        let state = MixState::new(&layout);
+        let mut group_levels = [100u8; MAX_GROUPS];
+        group_levels[0] = 50;
+        state.update(MixValues {
+            group_levels,
+            ..MixValues::default()
+        });
+
+        // Valid mapping: the group level scales the channel.
+        assert_eq!(state.snapshot().channel_group[0], Some(0));
+        assert_eq!(mix_channels(&[10_000], 1, state.snapshot()), [5_000, 0]);
+
+        // The device no longer has that channel, so the group is mapped to nothing and the channel
+        // mixes at its own gain. The stored group level is preserved for when the channel returns.
+        let invalid = GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![],
+        }]);
+        state.set_group_layout(&invalid);
+
+        assert_eq!(state.snapshot().channel_group[0], None);
+        assert_eq!(state.snapshot().group_levels[0], 50);
+        assert_eq!(mix_channels(&[10_000], 1, state.snapshot()), [10_000, 0]);
     }
 }

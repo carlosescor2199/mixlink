@@ -264,12 +264,9 @@ class MainActivity : Activity(), PmonPlayer.Listener, ControlChannel.Listener {
     )
 
     private fun syncChannelControls(channels: Int) {
-        if (mixState.sourceChannels == channels && mixState.channelGains.size == channels) return
-        mixState.sourceChannels = channels
-        mixState.channelGains = IntArray(channels) { 100 }
-        mixState.channelPans = IntArray(channels) { index -> defaultPan(index) }
-        mixState.channelMutes = BooleanArray(channels)
-        mixState.channelSolos = BooleanArray(channels)
+        // A re-sent `config` with a different count resizes the per-channel state and asks for the
+        // controls to be rebuilt on the same connection; an unchanged count is a no-op.
+        if (!mixState.applySourceChannels(channels)) return
         runOnUiThread {
             rebuildChannelControls(this, channelContainer, channels, mixState) { control.sendMixControl() }
             renderMusicianChannel()

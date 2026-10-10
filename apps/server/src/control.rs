@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -22,11 +22,61 @@ use crate::protocol::{control_error, mix_ack, parse_mix_command, ControlConfig, 
 /// above zero. The IP is the join key between [MixState], the UDP target and the control peer.
 pub(crate) type ControlPeers = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
+/// How often a control connection checks whether a device switch changed the channel count.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The live control configuration shared between the engine and every connection.
+///
+/// A device switch can change the captured channel count while the server runs. The engine stores the
+/// current count here; each connection notices a change on its next poll and re-sends `config` on the
+/// same socket, so a client rebuilds its per-channel controls without losing the control channel.
+pub(crate) struct ConfigState {
+    channels: AtomicU8,
+}
+
+impl ConfigState {
+    pub(crate) fn new(channels: u8) -> Self {
+        Self {
+            channels: AtomicU8::new(channels),
+        }
+    }
+
+    pub(crate) fn current(&self) -> u8 {
+        self.channels.load(Ordering::SeqCst)
+    }
+
+    /// Publishes a new channel count. Storing an unchanged count is harmless: a connection compares
+    /// it against the count it last sent.
+    pub(crate) fn set_channels(&self, channels: u8) {
+        self.channels.store(channels, Ordering::SeqCst);
+    }
+}
+
+/// Builds the `config` control message for a channel count and group layout.
+///
+/// Free of connection state so it can be sent on connect and re-sent on a device switch from the
+/// same code, which is what keeps the two messages identical in shape.
+fn config_message(source_channels: u8, groups: &GroupLayout) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&ControlConfig {
+        message_type: "config",
+        source_channels,
+        sample_rate: TARGET_SAMPLE_RATE,
+        groups: groups
+            .groups()
+            .iter()
+            .map(|group| GroupConfig {
+                name: group.name.clone(),
+                channels: group.channels.clone(),
+            })
+            .collect(),
+    })
+}
+
 pub(crate) fn spawn_control_thread(
     control_port: u16,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     stopped: Arc<AtomicBool>,
-    source_channels: u8,
+    config_state: Arc<ConfigState>,
     groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
@@ -57,7 +107,7 @@ pub(crate) fn spawn_control_thread(
             listener,
             mix_states,
             stopped,
-            source_channels,
+            config_state,
             groups,
             peers,
             events,
@@ -69,7 +119,7 @@ async fn run_control_server(
     listener: std::net::TcpListener,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     stopped: Arc<AtomicBool>,
-    source_channels: u8,
+    config_state: Arc<ConfigState>,
     groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
@@ -94,6 +144,7 @@ async fn run_control_server(
             Some(accepted) => match accepted {
                 Ok((stream, peer)) => {
                     let states = Arc::clone(&mix_states);
+                    let config_state = Arc::clone(&config_state);
                     let groups = Arc::clone(&groups);
                     let peers = Arc::clone(&peers);
                     let events = events.clone();
@@ -102,7 +153,7 @@ async fn run_control_server(
                             stream,
                             peer,
                             states,
-                            source_channels,
+                            config_state,
                             groups,
                             peers,
                             events,
@@ -170,29 +221,73 @@ async fn handle_control_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
-    source_channels: u8,
+    config_state: Arc<ConfigState>,
     groups: Arc<GroupLayout>,
     peers: ControlPeers,
     events: EventBus,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let websocket = accept_async(stream).await?;
     let _peer = register_peer(&peers, &events, peer);
-    let (mut writer, mut reader) = websocket.split();
-    let config = serde_json::to_string(&ControlConfig {
-        message_type: "config",
-        source_channels,
-        sample_rate: TARGET_SAMPLE_RATE,
-        groups: groups
-            .groups()
-            .iter()
-            .map(|group| GroupConfig {
-                name: group.name.clone(),
-                channels: group.channels.clone(),
-            })
-            .collect(),
-    })?;
-    writer.send(Message::Text(config.into())).await?;
-    while let Some(message) = reader.next().await {
+    let (writer, mut reader) = websocket.split();
+
+    // The sink is shared between the read loop and the config watcher through an async mutex. The
+    // read loop only holds it while sending, never while parked in a read.
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let sent_channels = Arc::new(AtomicU8::new(config_state.current()));
+    writer
+        .lock()
+        .await
+        .send(Message::Text(
+            config_message(sent_channels.load(Ordering::SeqCst), &groups)?.into(),
+        ))
+        .await?;
+
+    // The watcher notices a device switch while the connection is idle and re-sends `config` on the
+    // SAME socket, so a client rebuilds its per-channel controls without losing the control channel.
+    let watcher_writer = Arc::clone(&writer);
+    let watcher_state = Arc::clone(&config_state);
+    let watcher_groups = Arc::clone(&groups);
+    let watcher_sent = Arc::clone(&sent_channels);
+    let watcher_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
+            let current = watcher_state.current();
+            if current == watcher_sent.load(Ordering::SeqCst) {
+                continue;
+            }
+            watcher_sent.store(current, Ordering::SeqCst);
+            let Ok(config) = config_message(current, &watcher_groups) else {
+                break;
+            };
+            if watcher_writer
+                .lock()
+                .await
+                .send(Message::Text(config.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    loop {
+        // Safety net for a runtime that does not drive the watcher's timer while this task is parked
+        // on a read: re-check the channel count before parking again, so the next client message also
+        // re-sends `config`. It is a cheap atomic load when nothing changed.
+        let current = config_state.current();
+        if current != sent_channels.load(Ordering::SeqCst) {
+            sent_channels.store(current, Ordering::SeqCst);
+            writer
+                .lock()
+                .await
+                .send(Message::Text(config_message(current, &groups)?.into()))
+                .await?;
+        }
+
+        let Some(message) = reader.next().await else {
+            break;
+        };
         let message = message?;
         match message {
             Message::Text(text) => {
@@ -207,12 +302,159 @@ async fn handle_control_connection(
                         Err(error) => control_error(error)?,
                     },
                 };
-                writer.send(Message::Text(response.into())).await?;
+                if writer
+                    .lock()
+                    .await
+                    .send(Message::Text(response.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             Message::Close(_) => break,
-            Message::Ping(payload) => writer.send(Message::Pong(payload)).await?,
+            Message::Ping(payload) => {
+                if writer
+                    .lock()
+                    .await
+                    .send(Message::Pong(payload))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             _ => {}
         }
     }
+
+    watcher_task.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mix::Group;
+
+    fn drums() -> GroupLayout {
+        GroupLayout::new(vec![Group {
+            name: "Drums".to_owned(),
+            channels: vec![0, 1],
+        }])
+    }
+
+    #[test]
+    fn config_message_carries_the_source_channels_and_groups() {
+        let json = config_message(4, &drums()).expect("config should serialize");
+
+        assert!(json.contains(r#""source_channels":4"#));
+        assert!(json.contains(r#""groups":[{"name":"Drums","channels":[0,1]}]"#));
+    }
+
+    #[test]
+    fn config_state_reports_the_latest_channel_count() {
+        let state = ConfigState::new(2);
+
+        assert_eq!(state.current(), 2);
+
+        state.set_channels(4);
+
+        assert_eq!(state.current(), 4);
+    }
+
+    use tokio_tungstenite::connect_async;
+
+    type ClientStream = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn read_source_channels(client: &mut ClientStream) -> Option<u8> {
+        while let Some(message) = client.next().await {
+            if let Ok(Message::Text(text)) = message {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if value.get("type").and_then(|kind| kind.as_str()) == Some("config") {
+                        return value
+                            .get("source_channels")
+                            .and_then(|channels| channels.as_u64())
+                            .map(|channels| channels as u8);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Exercises the re-send over a real socket, without audio hardware: a client that connected
+    /// with two channels learns about four on the same connection.
+    ///
+    /// The server runs on its own runtime thread, exactly as the engine runs it, so the client's
+    /// runtime and the accept loop never share a scheduler.
+    #[tokio::test]
+    async fn a_channel_count_change_is_pushed_to_a_connected_client() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control listener");
+        let address = listener.local_addr().expect("listener address");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let config_state = Arc::new(ConfigState::new(2));
+
+        let server_stopped = Arc::clone(&stopped);
+        let server_config = Arc::clone(&config_state);
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("control runtime should build");
+            runtime.block_on(run_control_server(
+                listener,
+                Arc::new(HashMap::new()),
+                server_stopped,
+                server_config,
+                Arc::new(drums()),
+                Arc::new(Mutex::new(HashMap::new())),
+                EventBus::default(),
+            ));
+        });
+
+        let (mut client, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_async(format!("ws://{address}")),
+        )
+        .await
+        .expect("client should connect within 5s")
+        .expect("client should connect");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), read_source_channels(&mut client))
+                .await
+                .expect("first config should arrive"),
+            Some(2)
+        );
+
+        // The equivalent of the engine publishing a new device's channel count.
+        config_state.set_channels(4);
+
+        // The connection re-checks the channel count before each read, so any client message makes
+        // it re-send `config`. A mix command is the message a musician's client would send anyway.
+        let mix = r#"{"type":"mix","volume_percent":80,"max_level_percent":90,"muted":false}"#;
+        client
+            .send(Message::Text(mix.into()))
+            .await
+            .expect("client should send");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), read_source_channels(&mut client))
+                .await
+                .expect("re-sent config should arrive"),
+            Some(4)
+        );
+
+        stopped.store(true, Ordering::SeqCst);
+        // The accept loop re-checks `stopped` on the next accept, so nudge it with one connection so
+        // the server thread can exit deterministically.
+        let _ = std::net::TcpStream::connect(address);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || server.join()),
+        )
+        .await;
+    }
 }

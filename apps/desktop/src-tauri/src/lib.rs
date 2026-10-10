@@ -8,7 +8,7 @@ pub mod commands;
 pub mod dto;
 
 use commands::EngineState;
-use dto::{EngineStatusDto, StartRequest, StartSummary};
+use dto::{EngineStatusDto, InputDeviceDto, StartRequest, StartSummary};
 use tauri::State;
 
 /// Fails to compile rather than at runtime if the engine ever gains a non-`Send` field, because
@@ -36,6 +36,19 @@ async fn stop_engine(state: State<'_, EngineState>) -> Result<(), String> {
     commands::stop_engine(state.inner())
 }
 
+#[tauri::command]
+async fn list_input_devices() -> Result<Vec<InputDeviceDto>, String> {
+    commands::list_input_devices()
+}
+
+#[tauri::command]
+async fn switch_device(
+    state: State<'_, EngineState>,
+    device: String,
+) -> Result<StartSummary, String> {
+    commands::switch_device(state.inner(), device)
+}
+
 /// Builds and runs the desktop application.
 pub fn run() {
     tauri::Builder::default()
@@ -43,7 +56,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_engine,
             engine_status,
-            stop_engine
+            stop_engine,
+            list_input_devices,
+            switch_device
         ])
         .run(tauri::generate_context!())
         .expect("error while running the MixLink desktop shell");

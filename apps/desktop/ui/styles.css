@@ -422,3 +422,79 @@ body {
 .empty[hidden] {
   display: none;
 }
+
+/* Device selector and switch warning ------------------------------------- */
+
+.readout--device {
+  grid-column: 1 / -1;
+}
+
+.select {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  max-width: 560px;
+  padding: 6px 10px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.select:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.warning {
+  margin-top: 8px;
+  padding: 8px 10px;
+  max-width: 720px;
+  border: 1px solid rgba(255, 176, 32, 0.45);
+  border-radius: 6px;
+  background: rgba(255, 176, 32, 0.08);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.warning[hidden] {
+  display: none;
+}
+
+.warning-actions {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: 10px;
+  vertical-align: middle;
+}
+
+/* Group chips ------------------------------------------------------------ */
+
+.groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.groups[hidden] {
+  display: none;
+}
+
+.chip {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.chip--invalid {
+  color: var(--accent);
+  border-color: rgba(255, 176, 32, 0.5);
+  background: rgba(255, 176, 32, 0.08);
+}

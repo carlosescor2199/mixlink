@@ -91,5 +91,3 @@ private fun panLabel(index: Int, percent: Int): String {
     }
     return "Pan ${index + 1}: $position"
 }
-
-internal fun defaultPan(index: Int): Int = if (index % 2 == 0) 0 else 100
