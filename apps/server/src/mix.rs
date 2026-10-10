@@ -59,17 +59,21 @@ pub(crate) struct MixState {
     muted: AtomicBool,
 }
 
+/// A plain, copyable snapshot of one client's mix.
+///
+/// This is the engine's public view of the mix: atomics become plain values, so a UI can hold,
+/// compare and render it without touching the live state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MixValues {
-    pub(crate) channel_gains: [u8; MAX_MIX_CHANNELS],
-    pub(crate) pans: [u8; MAX_MIX_CHANNELS],
-    pub(crate) channel_muted: [bool; MAX_MIX_CHANNELS],
-    pub(crate) channel_solo: [bool; MAX_MIX_CHANNELS],
-    pub(crate) group_levels: [u8; MAX_GROUPS],
-    pub(crate) channel_group: [Option<usize>; MAX_MIX_CHANNELS],
-    pub(crate) volume_percent: u8,
-    pub(crate) max_level_percent: u8,
-    pub(crate) muted: bool,
+pub struct MixValues {
+    pub channel_gains: [u8; MAX_MIX_CHANNELS],
+    pub pans: [u8; MAX_MIX_CHANNELS],
+    pub channel_muted: [bool; MAX_MIX_CHANNELS],
+    pub channel_solo: [bool; MAX_MIX_CHANNELS],
+    pub group_levels: [u8; MAX_GROUPS],
+    pub channel_group: [Option<usize>; MAX_MIX_CHANNELS],
+    pub volume_percent: u8,
+    pub max_level_percent: u8,
+    pub muted: bool,
 }
 
 /// Default pan keeps the captured interleaved layout: even sources hard left, odd sources hard

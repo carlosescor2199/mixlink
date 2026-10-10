@@ -8,29 +8,37 @@ use crate::mix::{Group, GroupLayout, MAX_GROUPS};
 const DEFAULT_TARGET: &str = "127.0.0.1:50000";
 const DEFAULT_CONTROL_PORT: u16 = 50001;
 
+/// The engine's startup configuration, independent of how it was gathered.
+///
+/// The command line fills this in [parse_arguments], but a UI can build one directly and hand it to
+/// [crate::start] without parsing anything.
 #[derive(Debug)]
-pub(crate) struct Arguments {
-    pub(crate) device_filter: Option<String>,
-    pub(crate) targets: Vec<String>,
-    pub(crate) control_port: u16,
-    pub(crate) groups: Vec<GroupDefinition>,
+pub struct EngineConfig {
+    pub device_filter: Option<String>,
+    pub targets: Vec<String>,
+    pub control_port: u16,
+    pub groups: Vec<GroupDefinition>,
 }
+
+/// The crate-internal name the parsing tests use for [EngineConfig].
+#[cfg(test)]
+pub(crate) type Arguments = EngineConfig;
 
 /// A group as the engineer typed it: a name and 1-based channel numbers.
 ///
 /// The conversion to the protocol's 0-based indices needs the captured channel count, so it happens
 /// in [validate_groups] once the input device has been selected.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct GroupDefinition {
-    pub(crate) name: String,
-    pub(crate) channels: Vec<usize>,
+pub struct GroupDefinition {
+    pub name: String,
+    pub channels: Vec<usize>,
 }
 
-pub(crate) fn parse_arguments() -> Result<Arguments, Box<dyn Error>> {
+pub fn parse_arguments() -> Result<EngineConfig, Box<dyn Error>> {
     parse_from(env::args().skip(1))
 }
 
-fn parse_from(arguments: impl Iterator<Item = String>) -> Result<Arguments, Box<dyn Error>> {
+fn parse_from(arguments: impl Iterator<Item = String>) -> Result<EngineConfig, Box<dyn Error>> {
     let mut arguments = arguments;
     let mut device_filter = None;
     let mut targets = Vec::new();
@@ -78,7 +86,7 @@ fn parse_from(arguments: impl Iterator<Item = String>) -> Result<Arguments, Box<
         targets.push(DEFAULT_TARGET.to_owned());
     }
 
-    Ok(Arguments {
+    Ok(EngineConfig {
         device_filter,
         targets,
         control_port,

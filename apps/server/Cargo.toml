@@ -3,6 +3,14 @@ name = "personal-monitoring"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "personal_monitoring"
+path = "src/lib.rs"
+
+[[bin]]
+name = "personal-monitoring"
+path = "src/main.rs"
+
 [dependencies]
 cpal = "0.18"
 ctrlc = "3.4"

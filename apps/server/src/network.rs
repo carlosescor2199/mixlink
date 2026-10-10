@@ -14,11 +14,23 @@ pub(crate) struct PacketStats {
     pub(crate) discarded: AtomicU64,
 }
 
+/// Send counters for one target, so the UI can attribute loss to a musician instead of a global
+/// total.
+///
+/// [PacketStats] stays as the global total the CLI summary prints; these are additive and do not
+/// change what is sent on the wire.
+#[derive(Default)]
+pub(crate) struct TargetCounters {
+    pub(crate) sent: AtomicU64,
+    pub(crate) discarded: AtomicU64,
+}
+
 pub(crate) fn spawn_network_thread(
     packet_receiver: Receiver<AudioPacket>,
     targets: Vec<SocketAddr>,
     mix_states: Arc<HashMap<IpAddr, Arc<MixState>>>,
     packet_stats: Arc<PacketStats>,
+    target_counters: Arc<HashMap<IpAddr, TargetCounters>>,
 ) -> Result<JoinHandle<()>, Box<dyn Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     Ok(thread::spawn(move || {
@@ -27,6 +39,9 @@ pub(crate) fn spawn_network_thread(
                 let mix_state = mix_states
                     .get(&target.ip())
                     .expect("every target must have a mix state");
+                let counters = target_counters
+                    .get(&target.ip())
+                    .expect("every target must have send counters");
                 let samples = mix_channels(
                     &packet.samples,
                     usize::from(packet.channels),
@@ -42,9 +57,11 @@ pub(crate) fn spawn_network_thread(
                 match socket.send_to(&bytes, target) {
                     Ok(_) => {
                         packet_stats.sent.fetch_add(1, Ordering::Relaxed);
+                        counters.sent.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(error) => {
                         packet_stats.discarded.fetch_add(1, Ordering::Relaxed);
+                        counters.discarded.fetch_add(1, Ordering::Relaxed);
                         eprintln!("UDP send error to {target}: {error}");
                     }
                 }
